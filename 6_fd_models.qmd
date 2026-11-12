@@ -1,0 +1,674 @@
+---
+title: "FD models"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+```{r}
+#| message: false
+#| warning: false
+library(conflicted)
+library(tidyverse)
+library(tidybayes)
+library(distributional)
+library(brms)
+library(ggdist)
+library(bayesplot)
+library(patchwork)
+library(DT)
+
+source("functions.R")
+
+conflicts_prefer(dplyr::filter,
+                 stats::lag,
+                 distributional::parameters,
+                 brms::ar,
+                 brms::dstudent_t,
+                 brms::pstudent_t,
+                 brms::qstudent_t,
+                 brms::rstudent_t,
+                 brms::rhat)
+
+options(mc.cores = parallel::detectCores())
+options(brms.file_refit = "on_change")
+options(brms.backend = "cmdstanr")
+options(contrasts = c("contr.sum", "contr.poly"))
+options(digits = 3)
+
+set.seed(2058)
+
+if (!dir.exists("fits/fd")) dir.create("fits/fd", recursive = T)
+if (!dir.exists("fits/extra")) dir.create("fits/extra", recursive = T)
+
+theme_set(theme_minimal())
+
+load("intermediate/SES.RData")
+load("intermediate/weather.RData")
+
+show <- vars(!c(lprior, lp__, b_Intercept))
+```
+
+# Preparing the FD data
+
+```{r}
+#unrestricted SES
+results_all <- results_all |> 
+  mutate(across(date:subplot, as_factor)) |> 
+  rename(year = date, site = plot)
+datatable(results_all)
+
+#regional pool
+results_sites <- results_sites |> 
+  mutate(across(date:subplot, as_factor)) |> 
+  rename(year = date, site = plot)
+datatable(results_sites)
+
+#temporal pool
+results_years <- results_years |> 
+  mutate(across(date:subplot, as_factor)) |> 
+  rename(year = date, site = plot)
+datatable(results_years)
+```
+
+# Join canopy cover
+
+Canopy cover percentage is scaled in the range 0-4, so that the prior for the regression coefficient corresponds to an increase of 25% in canopy cover, and zero (no canopy cover) is kept as reference value. This allows the use of the same prior as for the other effects, which speeds up computation.
+
+```{r}
+cover <- read_csv("Data/cover.csv") |> 
+  mutate(year = as_factor(year), 
+         site = as_factor(site),
+         #cover as proportion 0-4
+         cover = cover / 100 * 4)
+
+add_cover <- function(y) y |> 
+  map(\(x) x |> left_join(cover))
+
+data_ITP_above <- add_cover(data_ITP_above)
+
+data_ITP_below <- add_cover(data_ITP_below)
+
+data_ITP_overall <- add_cover(data_ITP_overall)
+```
+
+# Priors
+
+The choice of priors has been discussed in the simulation notebook, here are just the distributions. It is important to remember that the prior of the intercept applies after all predictors are centered, so all priors refer to deviations from the mean. In this case, the predictor is scaled by its standard deviation, before deriving the other predictors (site mean, mean-centered predictor), so the slope coefficients can be interpreted in terms of standard deviations of the predictor. Since the output is a SES, we expect the range to be roughly \[-2, 2\]. We can see that these priors are wide, but most of the probability is on smaller values.
+
+```{r}
+ggplot()+
+  stat_halfeye(aes(xdist = dist_student_t(3, 0, 0.7)),
+    fill = "seagreen1", .width = c(0.66, 0.95))+
+  scale_y_continuous(NULL, breaks = NULL)+
+  ggtitle("Prior for intercept and site fixed effects")
+```
+
+```{r}
+ggplot()+
+  stat_halfeye(aes(xdist = dist_normal(0, 1)),
+    fill = "lightsalmon", .width = c(0.66, 0.95))+
+  scale_y_continuous(NULL, breaks = NULL)+
+  ggtitle(expression("Prior for"~beta))
+```
+
+```{r}
+ggplot()+
+  stat_halfeye(aes(xdist = dist_truncated(dist_student_t(3, 0, 0.5), lower = 0)),
+                fill = "steelblue1", .width = c(0.66, 0.95))+
+  scale_y_continuous(NULL, breaks = NULL)+
+  ggtitle(expression("Prior for"~sigma))
+```
+
+```{r}
+prior <- c(prior(student_t(3, 0, 0.7), class = "Intercept"),
+           prior(normal(0, 1), class = "b"),
+           prior(student_t(3, 0, 0.7), class = "b", coef = "site1"),
+           prior(student_t(3, 0, 0.7), class = "b", coef = "site2"),
+           prior(student_t(3, 0, 0.7), class = "b", coef = "site3"),
+           prior(student_t(3, 0, 0.5), class = "sigma", lb = 0))
+
+#itp has only three sites
+prior_itp <- prior |> 
+  filter_out(coef == "site3")
+
+#soil_t_ofd has only two sites
+prior_soil <- prior_itp |> 
+  filter_out(coef == "site2")
+
+```
+
+Prior predictive simulation of the expected values:
+
+```{r}
+#since it's sampling only the prior, these are just to give a reference for the plot
+data_prior <- tibble(outcome = 0,
+                     x = seq(-2, 2, length.out = 10),
+                     cover = seq(0, 4, length.out = 10)) |>
+  expand_grid(z = seq(-2, 2, length.out = 10),
+              site = letters[1:4])
+
+prior_pred <- brm(outcome ~ x + z + x:z + cover + site,
+             data = data_prior,
+             sample_prior = "only",
+             prior = prior,
+             file = "fits/prior_fd",
+             seed = 2853)
+
+conditional_effects(prior_pred,
+                    spaghetti = T,
+                    ndraws = 200) |> 
+  plot(ask = F)
+
+```
+
+# Prepare data
+
+The following functions process the variables for modeling. Weather data is scaled by a representative value instead of the exact standard deviation in each dataset to have a consistent value across datasets, and this is stored alongside data.
+The site grand means are calculated and subtracted to obtain separate within and between site variations. This also makes the models fit more easily because the within-site effect parameters are uncorrelated with the site intercepts.
+
+```{r}
+variables <- c("air_t_mean", "soil_t_mean", "precipitation")
+
+imap(data_OFD,
+     \(x, idx) x |> 
+       summarise("{idx}" := sd(.data[[idx]]))) |> 
+  bind_cols() |> 
+  select(any_of(setdiff(variables, "soil_t_mean")))
+
+data_ITP_overall |> 
+  map(\(x) x |> 
+        summarise(across(any_of(variables), sd))) |> 
+  bind_rows() |> 
+  summarise(across(everything(), mean))
+
+data_ITP_above |> 
+  map(\(x) x |> 
+        summarise(across(any_of(variables), sd))) |> 
+  bind_rows() |> 
+  summarise(across(everything(), mean))
+
+data_ITP_below |> 
+  map(\(x) x |> 
+        summarise(across(any_of(variables), sd))) |> 
+  bind_rows() |> 
+  summarise(across(everything(), mean))
+```
+
+The standard deviations are roughly 2.5° C for temperature and 600 mm for precipitation. These are the representative values that will be used for scaling.
+
+```{r}
+sds <- c(2.5, 2.5, 600) |> 
+  set_names(variables)
+
+prepare <- function(data, vars = variables) {
+  data |> 
+    mutate(across(any_of(vars), 
+                  \(x) sds[[cur_column()]], 
+                  .names = "{.col}_sd"),
+           across(any_of(vars), 
+                  \(x) x / sds[[cur_column()]])) |> 
+    # calculate site means
+    mutate(across(any_of(vars), mean, 
+                  .names = "{.col}_site"),
+           across(any_of(vars),
+                  \(x) x - get(str_c(cur_column(), "_site")),
+                  .names = "{.col}_centered"),
+           .by = site)
+}
+```
+
+## OFD
+
+```{r}
+ofd <- inner_join(data_OFD$air_t_mean, data_OFD$precipitation) |> 
+  prepare()
+```
+
+## ITP
+
+```{r}
+above_itp <- data_ITP_above |> 
+  map(prepare)
+
+below_itp <- data_ITP_below |> 
+  map(prepare)
+
+overl_itp <- data_ITP_overall |> 
+  map(prepare)
+```
+
+# Years included in the models
+
+Following the selection of years with a vegetation survey and sufficient weather data, the years considered across all models are:
+
+```{r}
+#these three datasets are sufficient to identify all subsets of years
+years_across <- ofd |> 
+  select(year) |> 
+  bind_rows(above_itp[[1]] |>
+            select(year)) |> 
+  distinct(year) |> 
+  mutate(year = as.character(year)) |> 
+  arrange(year) |> 
+  pull()
+```
+
+This corresponds to a timespan of `{r} as.numeric(years_across) |> range() |> diff() |> sum(1)` years.
+
+## By model
+
+The years in each model:
+
+```{r}
+#OFD
+ofd |> 
+  distinct(year)
+
+#ITP
+above_itp[[1]] |> 
+  distinct(year)
+```
+
+The number of site-year combinations:
+
+```{r}
+ofd |> 
+  distinct(site, year) |> 
+  nrow()
+
+above_itp[[1]] |> 
+  distinct(site, year) |> 
+  nrow()
+```
+
+# Plotting FD-SES
+
+Before modelling, it would be useful to check the distributions of FD-SES. All three randomizations are shown, although the models will focus on the randomization using the local species pool.
+
+## Unrestricted randomization
+
+Overall, by year:
+
+```{r}
+results_all |> 
+  ggplot(aes(x = year, y = overall, fill = site)) +
+  geom_boxplot() +
+  scale_fill_brewer(type = "qual", palette = 8)+
+  theme_minimal()+
+  ggtitle("Overall unconstrained FD by year and site")
+```
+
+Overall, by site:
+
+```{r}
+results_all |> 
+  ggplot(aes(x = year, y = overall, fill = site)) +
+  geom_boxplot() +
+  scale_fill_brewer(type = "qual", palette = 8) +
+  facet_wrap(~ site, nrow = 1) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")+
+  ggtitle("Overall unconstrained FD by year and site")
+```
+
+All the trait groups:
+
+```{r}
+results_all |> 
+  pivot_longer(overall:below, names_to = "traits", values_to = "SES") |> 
+  ggplot(aes(x = year, y = SES, fill = site)) +
+  geom_boxplot(width = 0.4) +
+  scale_fill_brewer(type = "qual", palette = 8) +
+  facet_grid(vars(traits), vars(site), margins = "site") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")+
+  ggtitle("Unconstrained FD by site and year")
+```
+
+## Local species pool randomizations
+
+```{r}
+results_sites |> 
+  pivot_longer(overall:below, names_to = "traits", values_to = "SES") |> 
+  ggplot(aes(x = year, y = SES, fill = site)) +
+  geom_boxplot(width = 0.5, position = position_dodge2(padding = 0)) +
+  scale_fill_brewer(type = "qual", palette = 8) +
+  facet_grid(vars(traits), vars(site), margins = "site") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")+
+  ggtitle("FD from within-site randomization")
+```
+
+## Temporal species pool randomizations
+
+```{r}
+results_years |> 
+  pivot_longer(overall:below, names_to = "traits", values_to = "SES") |> 
+  ggplot(aes(x = year, y = SES, fill = site)) +
+  geom_boxplot(width = 0.5, position = position_dodge2(padding = 0)) + 
+  scale_fill_brewer(type = "qual", palette = 8, name = "site") +
+  facet_grid(vars(traits)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  ggtitle("FD from within-year randomization")
+```
+
+# Open-field weather models
+
+The specification of these models refers to the DAGs.
+
+## Aboveground FD on air temperature and precipitation
+
+Models for the total effect of air temperature, precipitation, and their interaction on aboveground FD-SES.
+
+```{r}
+fit_above_ofd <-  brm(above ~ air_t_mean_centered + precipitation_centered +
+                              air_t_mean_centered:precipitation_centered + site,
+                      data = ofd,
+                      prior = prior,
+                      file = "fits/fd/above.ofd",
+                      seed = 2853)
+
+prior_summary(fit_above_ofd)
+
+fit_above_ofd
+
+my_mcmc_pairs(fit_above_ofd)
+
+trank(fit_above_ofd)
+
+pp_check(fit_above_ofd)
+
+mcmc_intervals(fit_above_ofd, pars = show)
+
+my_ceffects(fit_above_ofd)
+```
+
+## Belowground FD
+
+Models for the total effect of soil temperature, precipitation, and their interaction on belowground FD-SES.
+
+```{r}
+fit_below_ofd <- brm(below ~ air_t_mean_centered + precipitation_centered +
+                       air_t_mean_centered:precipitation_centered + site,
+                     data = ofd,
+                     prior = prior_soil,
+                     file = "fits/fd/below.ofd",
+                     seed = 2853)
+
+prior_summary(fit_below_ofd)
+
+fit_below_ofd
+
+my_mcmc_pairs(fit_below_ofd)
+
+trank(fit_below_ofd)
+
+pp_check(fit_below_ofd)
+
+mcmc_intervals(fit_below_ofd, pars = show)
+
+my_ceffects(fit_below_ofd)
+```
+
+## Overall FD
+
+Models for the total effect of air temperature, precipitation, and their interaction on overall FD-SES.
+
+```{r}
+fit_overl_ofd <-  brm(overall ~ air_t_mean_centered + precipitation_centered +
+                        air_t_mean_centered:precipitation_centered + site,
+                      data = ofd,
+                      prior = prior,
+                      file = "fits/fd/overl.ofd",
+                      seed = 2853)
+
+prior_summary(fit_overl_ofd)
+
+fit_overl_ofd
+
+my_mcmc_pairs(fit_overl_ofd)
+
+trank(fit_overl_ofd)
+
+pp_check(fit_overl_ofd)
+
+mcmc_intervals(fit_overl_ofd, pars = show)
+
+my_ceffects(fit_overl_ofd)
+```
+
+# Sub-canopy weather models
+
+The main difference with the open-field models is that the models are fit to multiply imputed datasets (m = 5), instead of complete-case analysis. The procedure is mostly the same, but the plotted data points use as weather values those of the first imputation.
+
+**Note:** [brms 2.23.0 ignores the seed argument for `brm_multiple`](https://github.com/paul-buerkner/brms/issues/1862). This will be fixed in 2.24.0, for now the workaround is to specify "seed" in the control list.
+
+## Aboveground FD
+
+Models for the total effect of air temperature, precipitation, and their interaction on aboveground FD-SES.
+
+```{r}
+fit_above_itp <-  brm_multiple(above ~ air_t_mean_centered + precipitation_centered +
+                                 air_t_mean_centered:precipitation_centered +
+                                 cover + site,
+                               data = above_itp,
+                               prior = prior_itp,
+                               file = "fits/fd/above.itp",
+                               file_refit = "never",
+                               control = list(seed = 2853))
+
+prior_summary(fit_above_itp)
+
+fit_above_itp
+
+multiple_convergence(fit_above_itp)
+
+my_mcmc_pairs(fit_above_itp)
+
+trank(fit_above_itp)
+
+pp_check(fit_above_itp)
+
+mcmc_intervals(fit_above_itp, pars = show)
+
+my_ceffects(fit_above_itp)
+```
+
+## Belowground FD
+
+Models for the total effect of soil temperature, precipitation, and their interaction on belowgroumd FD-SES.
+
+```{r}
+fit_below_itp <-  brm_multiple(below ~ soil_t_mean_centered + precipitation_centered +
+                                 soil_t_mean_centered:precipitation_centered +
+                                 cover + site,
+                               data = below_itp,
+                               prior = prior_itp,
+                               file = "fits/fd/below.itp",
+                               file_refit = "never",
+                               control = list(seed = 2853))
+
+prior_summary(fit_below_itp)
+
+fit_below_itp
+
+multiple_convergence(fit_below_itp)
+
+my_mcmc_pairs(fit_below_itp)
+
+trank(fit_below_itp)
+
+pp_check(fit_below_itp)
+
+mcmc_intervals(fit_below_itp, pars = show)
+
+my_ceffects(fit_below_itp)
+```
+
+## Overall FD
+
+Models for the total effect of air temperature, precipitation, and their interaction on overall FD-SES.
+
+```{r}
+fit_overl_itp <-  brm_multiple(overall ~ air_t_mean_centered + precipitation_centered +
+                                 air_t_mean_centered:precipitation_centered +
+                                 cover + site,
+                               data = overl_itp,
+                               prior = prior_itp,
+                               file = "fits/fd/overl.itp",
+                               file_refit = "never",
+                               control = list(seed = 2853))
+
+prior_summary(fit_overl_itp)
+
+fit_overl_itp
+
+multiple_convergence(fit_overl_itp)
+
+my_mcmc_pairs(fit_overl_itp)
+
+trank(fit_overl_itp)
+
+pp_check(fit_overl_itp)
+
+mcmc_intervals(fit_overl_itp, pars = show)
+
+my_ceffects(fit_overl_itp)
+```
+
+# Explained vs. subplot variance
+
+The variance explained by the models on new data can be assessed through the Bayesian R^2^. A slightly different question, unlinked from the issue of how of the FD variation is explained by weather, is to relate the subplot variation within site-years to the variation between site-years. It is evident from the box-plots that the FD-SES variation among subplots is large compared to the variation between sites and years. This can be quantified through a specialized model that has an intercept for each site-year. Here, R^2^ is not used as a measure of model fit, for which it has many flaws, because this kind of model is obviously overfit. Rather, it is used to assess the proportion of variance explained, as intended for the Bayesian version [@RsquaredBayesian]. By recalling the Bayesian R^2^ formula:
+
+$\frac{Explained~variance}{Explained~variance + Residual~variance}$
+
+Since the residual variance of this model is the subplot variance within site-years, this can be expressed as:
+
+$1-\frac{Explained~variance}{Explained~variance + Residual~variance}=\frac{Residual~variance}{Explained~variance + Residual~variance}$
+
+```{r}
+prior <- c(prior(student_t(3, 0, 0.7), class = "Intercept"),
+           prior(student_t(3, 0, 0.7), class = "b"),
+           prior(student_t(3, 0, 0.5), class = "sigma", lb = 0))
+
+fit_subplot_above <- brm(above ~ site:year,
+                         data = results_sites,
+                         prior = prior,
+                         seed = 2853,
+                         file = "fits/extra/subplot.above",
+                         file_refit = "never")
+
+(1 - bayes_R2(fit_subplot_above, summary = F)) |> 
+  mean_qi()
+
+fit_subplot_below <- brm(below ~ site:year,
+                         data = results_sites,
+                         prior = prior,
+                         seed = 2853,
+                         file = "fits/extra/subplot.below",
+                         file_refit = "never")
+
+(1 - bayes_R2(fit_subplot_below, summary = F)) |> 
+  mean_qi()
+
+fit_subplot_overall <- brm(overall ~ site:year,
+                         data = results_sites,
+                         prior = prior,
+                         seed = 2853,
+                         file = "fits/extra/subplot.overall",
+                         file_refit = "never")
+
+(1 - bayes_R2(fit_subplot_overall, summary = F)) |> 
+  mean_qi()
+```
+
+# Store fits
+
+```{r}
+#load brms fits
+fits <- list.files("fits/fd", pattern = "\\.rds$", full.names = T) |> 
+  map(readRDS) |> 
+  as_tibble_col(column_name = "fit")
+
+#organize the models
+fits <- fits |> 
+  mutate(name = list.files("fits/fd", pattern = "\\.rds$") |> 
+           str_remove("\\.rds$") |> 
+           str_replace_all("\\.", "_"),
+  trait = word(name, 1, sep = "_"),
+  type = word(name, 2, sep = "_"))
+
+#fix names
+fits <- fits |> 
+  mutate(trait = if_else(trait == "overl", "overall", trait))
+
+#add data
+fits <- fits |> 
+  mutate(data = map(name, \(x) if (str_detect(x, "ofd")) ofd else rlang::env_get(topenv(), x)),
+         data = map2(type, data,
+                     \(x, y) if (x == "ofd"){
+                       y
+                     } else {
+                       #get average of imputations
+                       map(y, \(t) t |> 
+                             mutate(obs_id = row_number())) |>
+                         bind_rows(.id = "imp") |> 
+                         summarise(across(where(is.numeric), mean),
+                                   .by = c(site, obs_id)) |> 
+                         select(!obs_id)
+                     }))
+```
+
+# Diagnostics
+
+## Check number of divergent transitions
+
+```{r}
+fits <- fits |> 
+    mutate(n_divergent = map_int(fit, 
+                   \(x) nuts_params(x) |> 
+                     filter(Parameter == "divergent__" & Value == 1) |> 
+                     nrow()))
+
+fits |> 
+  select(!c(data, fit)) |> 
+  filter(n_divergent > 0)
+```
+
+## Pareto *k*
+
+```{r}
+fits <- fits |> 
+  mutate(n_pareto_k = map_int(fit, \(x) x |> 
+                          log_lik() |> 
+                          (\(ll) psis(-ll))() |> 
+                          loo::pareto_k_ids() |> 
+                          length()))
+
+fits |> 
+  select(!c(data, fit)) |> 
+  filter(n_pareto_k > 0)
+```
+
+It must be pointed out that the pareto *k* diagnostic is not completely ready to handle multiple imputation. It uses the first imputed dataset, but influential points could arise simply because the posterior is calculated not just from that data.
+
+# Save results
+
+```{r}
+fits |> 
+  select(!c(n_divergent, n_pareto_k)) |> 
+  saveRDS("intermediate/fits_fd.rds")
+```
+
+# Session info
+
+```{r}
+#| echo: false
+sessioninfo::session_info()
+```

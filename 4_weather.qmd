@@ -1,0 +1,929 @@
+---
+title: "Weather data"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+```{r}
+#| message: false
+#| warning: false
+library(conflicted)
+library(tidyverse)
+library(plotly)
+library(mice)
+library(ggmice)
+library(ggrepel)
+library(DT)
+library(lmodel2)
+
+set.seed(19347)
+
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::select)
+
+options(DT.options = list(pageLength = 10))
+
+theme_set(theme_minimal())
+
+load("intermediate/SES.RData")
+
+#process FD dataframe
+results_sites <- results_sites |> 
+  rename(year = date, site = plot)
+
+years <- unique(results_all$date)
+```
+
+## Matrix product backend
+
+Despite setting a seed, imputations with `mice()` from different machines or operating systems might differ slightly, while imputations from the same machine and OS should be fully reproducible. I narrowed this down to different matrix product implementations. To circumvent this problem, the following line sets NETLIB as default matrix backend (default on Windows) if available. Alternatively, use the provided `weather.RData` file in notebooks following this one.
+
+```{r}
+if (.Platform$OS.type == "unix"){
+  library(flexiblas)
+  if(flexiblas_avail() && "NETLIB" %in% flexiblas_list()){
+    flexiblas_switch(flexiblas_load_backend("NETLIB"))
+  }
+  flexiblas_current_backend()
+}
+```
+
+Based on the vegetation surveys, my years of interest are `{r} years`.
+
+# Sample dates
+
+The weather data will be summarized as annual means, starting as monthly averages. To respect causality, since the vegetation sampling was carried out in summer, instead of calculating the means for the solar year, we calculate it from the 12 months before the sampling in each case.
+This chunk gets the date for each sampling, and makes a sequence of the 12 months before.
+
+```{r}
+#toy example
+toy <- tibble(plot = 1:2,
+              date = c("15/05/2001", "02/07/1999")) |> 
+  mutate(date = dmy(date)) |> 
+  mutate(year_before = date - years(1)) |> 
+  mutate(month = map(year_before, \(x) x %m+% months(0:11))) |> 
+  unnest(month) |> 
+  mutate(year = year(month),
+         month = month(month))
+  
+head(toy, 13)
+
+#tibble to refer plot codes to plot names
+site_lookup <- tibble(code_plot = c(1, 3, 4, 20),
+                      site = c("01-ABR1", "03-CAL1", "04-CAM1", "20-VEN1"))
+
+dates <- read_csv("Data/sample_dates.csv") |> 
+  filter(code_country == 5) |> # Italy is 5
+  filter(code_plot %in% site_lookup$code_plot) |> # only sites of interest
+  filter(survey_year %in% years) |> # only years of interest
+  filter(code_fence == 1) |> # only surveys inside the plot
+  mutate(date_sampling = ymd(date_sampling)) |> 
+  filter(month(date_sampling) |> between(6, 8)) |>  # take summer survey
+  mutate(year_before = date_sampling - years(1)) |> 
+  mutate(month = map(year_before, \(x) x %m+% months(0:11))) |> 
+  unnest(month) |> 
+  mutate(year = year(month),
+         month = month(month)) |> 
+  left_join(site_lookup)
+
+head(dates, 13)
+
+#check if exactly 1 each year, site, month
+dates |>
+  group_by(survey_year, site, month) |> 
+  count() |> 
+  ungroup() |> 
+  tidyr::complete(survey_year, site, month = 1:12) |> 
+  filter(n != 1)
+
+#check if 12 for each survey and site
+dates |> 
+  group_by(site, survey_year) |> 
+  count() |> 
+  filter(n != 12)
+
+#these are all the months required for weather data. Some will be missing
+dates <- dates |> 
+  select(site, survey_year, year, month)
+
+#check whether all FD data appears in dates tibble
+results_all |> 
+  distinct(plot, date) |> 
+  anti_join(dates |> 
+              rename(plot = site, date = survey_year))
+
+#check whether there are dates not corresponding to FD
+dates |> 
+  distinct(site, survey_year) |> 
+  anti_join(results_all |> 
+              rename(site = plot, survey_year = date))
+```
+
+# Monthly data
+
+```{r}
+weat <- read_csv("Data/weather_data.csv") |> 
+  janitor::clean_names() |> 
+  rename("type" = type_open_field_vs_in_the_plot) |> 
+  mutate(type = fct(type, levels = c("ITP", "OFD"))) |> 
+  select(!starts_with("n_"))
+```
+
+## Check within-site weather patterns
+
+These are with each year stacked on top of one another.
+
+```{r}
+pat_st <- c("air_t_mean", "soil_t_mean", "solar_radiation_mean",
+            "relative_humidity_mean", "precipitation") |> 
+  set_names() |> 
+  map(\(v){
+    p <- weat |> 
+      mutate(year = as_factor(year)) |> 
+      ggplot(aes(x = month, y = .data[[v]], color = year))+
+      geom_point(size = 0.8)+
+      geom_line(alpha = 0.8)+
+      scale_x_continuous(breaks = 1:12)+
+      facet_grid(vars(type), vars(site))+
+      labs(title = v)
+    ggplotly(p)
+  })
+
+pat_st |> 
+  htmltools::tagList()
+```
+
+These are continuous time series by site.
+
+```{r}
+pat_ts <- c("air_t_mean", "soil_t_mean", "solar_radiation_mean",
+            "relative_humidity_mean", "precipitation") |> 
+  set_names() |> 
+  map(\(v){
+    p <- weat |> 
+      mutate(date = make_date(year = year, month = month)) |> 
+      ggplot(aes(x = date, y = .data[[v]], color = type))+
+      geom_point(size = 0.8)+
+      geom_line(alpha = 0.8)+
+      scale_x_date(date_breaks = "1 year", date_labels = "%Y")+
+      facet_wrap(vars(site), ncol = 1, axes = "all_x")+
+      labs(title = v)
+    ggplotly(p)
+  })
+  
+pat_ts |> 
+  htmltools::tagList()
+```
+
+There are some clear inconsistencies in the data. These should be removed before proceeding.
+
+```{r}
+# remove 20-VEN1 soil T ITP in 2010 and 2011
+weat <- weat |> 
+  mutate(soil_t_mean = replace_when(soil_t_mean, site == "20-VEN1" & year %in% 2010:2011 & type == "ITP" ~ NA))
+
+# remove 03-CAL1 soil T OFD in 2013, 2014, 2015
+weat <- weat |> 
+  mutate(soil_t_mean = replace_when(soil_t_mean, site == "03-CAL1" & year %in% 2013:2015 & type == "OFD" ~ NA))
+
+# remove 03-CAL1 solar radiation in July 2011
+weat <- weat |> 
+  mutate(across(c(solar_radiation_mean, solar_radiation_max), 
+                \(x) replace_when(x, site == "03-CAL1" & year == 2011 & month == 7 ~ NA)))
+
+# remove whole years with 0 precipitation
+weat <- weat |> 
+  mutate(precipitation = replace_when(precipitation, site == "01-ABR1" & year %in% c(2007, 2011, 2012) & type == "ITP" ~ NA,
+                                      site == "03-CAL1" & year == 2015 & type == "OFD" ~ NA,
+                                      site == "03-CAL1" & year == 2014 & type == "OFD" & month %in% 9:12 ~ NA))
+
+```
+
+## Calculating the number of months with weather data for each survey
+
+We have a table which specifies, for each site and sampling year, the required months of weather data. Let's count how many of those are available.
+
+```{r}
+#only weather data relevant for vegetation surveys here
+weat_mo <- weat |> 
+  semi_join(dates)
+
+datatable(weat_mo)
+
+OFD <- weat_mo |> 
+  filter(type == "OFD") |> 
+  right_join(dates)
+
+ITP <- weat_mo |> 
+  filter(type == "ITP") |> 
+  right_join(dates)
+```
+
+Checking the open field data:
+
+```{r}
+months_OFD <- OFD |> 
+  group_by(site, survey_year) |> 
+  summarise(across(where(is.numeric), ~sum(!is.na(.)))) |> 
+  ungroup() |> 
+  mutate(across(everything(), ~replace_na(., 0))) |> 
+  select(-year, -month)
+
+datatable(months_OFD)
+```
+
+Checking the data in the plot:
+
+```{r}
+months_ITP <- ITP |> 
+  group_by(site, survey_year) |> 
+  summarise(across(where(is.numeric), ~sum(!is.na(.)))) |> 
+  ungroup() |> 
+  mutate(across(everything(), ~replace_na(., 0))) |> 
+  select(-year, -month)
+
+datatable(months_ITP)
+```
+
+And the difference between the two (ITP-OFD):
+
+```{r}
+type_diff <- months_ITP[1:2] |> 
+  bind_cols(months_ITP[3:ncol(months_ITP)]- months_OFD[3:ncol(months_OFD)])
+datatable(type_diff) |> 
+  formatStyle(names(type_diff), backgroundColor = styleInterval(-1, c("pink", "white")))
+```
+
+## Plotting the weather data completeness
+
+These are the number of months with weather data for each survey year and site.
+
+```{r}
+months_weat <- bind_rows(list(ITP = months_ITP, OFD = months_OFD), .id = "type") |> 
+  mutate(survey_year = as_factor(survey_year))
+```
+
+```{r}
+plotweat <- function(x, var){
+    x |> 
+  select(1:3, {{var}}) |> 
+  ggplot(aes(x = survey_year, y = {{var}}, fill = type))+
+  geom_col(position = "dodge")+
+  scale_x_discrete(drop = FALSE) +
+  scale_y_continuous(breaks = seq(0, 12, 2))+
+  facet_wrap(~site)+
+  theme(axis.text.x = element_text(angle = 90))
+}
+```
+
+```{r}
+plotweat(months_weat, air_t_mean)+
+  ggtitle("Mean air temperature")
+```
+
+```{r}
+plotweat(months_weat, precipitation)+
+  ggtitle("Precipitation")
+```
+
+```{r}
+plotweat(months_weat, soil_t_mean)+
+  ggtitle("Soil temperature")
+```
+
+```{r}
+plotweat(months_weat, solar_radiation_mean)+
+  ggtitle("Solar radiation")
+```
+
+```{r}
+plotweat(months_weat, relative_humidity_mean)+
+  ggtitle("Relative humidity")
+```
+
+```{r}
+plotweat(months_weat, wind_speed_mean)+
+  ggtitle("Wind speed")
+```
+
+# Keep complete OFD data
+
+This is the first step in handling missing weather data. It is clear that monthly coverage is incomplete in some sites and years. This is due to malfunctioning of the stations and we assume there is no bias in omitting these data. This is possible for open-field data where there is good coverage in most site-years. The annual means are calculated from monthly averages, giving equal weight to each month.
+
+```{r}
+vars <- names(months_OFD) |> 
+  str_subset("site|survey_year|_min|_max", negate = T)
+
+#site-years with 11 or 12 months
+OFD_keep <- map(vars, \(x) {
+  months_OFD |>
+    select(site, survey_year, all_of(x)) |>
+    filter(.data[[x]] == 12)
+  }) |> 
+  set_names(vars)
+
+#subset data
+complete_OFD <- OFD_keep |> 
+  imap(\(x, idx) OFD |>
+        select(site, survey_year, all_of(idx)) |> 
+        semi_join(x[,1:2]))
+
+#annual means
+complete_OFD <- complete_OFD |> 
+  imap(\(x, idx) if(str_detect(idx, "precipitation")){
+    #sum precipitation
+    x |> 
+      summarise("{idx}" := sum(.data[[idx]], na.rm = T),
+                   .by = c(site, survey_year))
+  } else {
+    #average others
+    x |> 
+         summarise("{idx}" := mean(.data[[idx]], na.rm = T),
+                   .by = c(site, survey_year))
+  })
+```
+
+# Impute missing ITP data
+
+Since missingness is higher for sub-canopy data, we choose imputation instead of complete-case analysis. This also allows presenting both approaches. 
+
+```{r}
+# convert weather data into wider format, so that OFD can be used to impute ITP
+weat_imp <- weat |>
+  pivot_wider(names_from = type,
+    names_sep = "_",
+    values_from = air_t_mean:wind_speed_max)
+```
+
+We are using canopy cover measured during surveys as one predictor of sub-canopy weather.
+
+```{r}
+# join canopy cover
+
+cover <- read_csv("Data/cover.csv")
+
+weat_imp <- weat_imp |> 
+  left_join(cover)
+
+# keep for later
+
+weat_imp_raw <- weat_imp
+```
+
+The probability of missingness is affected by the site identity, so including this variable makes the missingness ignorable. For the imputation model and the analysis model to be *congenial*, the outcome variable should be included in the imputation [@dagostinomcgowan2024]. This leads to a compromise, because the outcome (FD) has replicate measurements for each year and site (subplots), while the weather data is site-level, but has monthly measurements. We need to perform imputation at the month level, even if the final model will be done on annual means, because missingness is not homogeneous and it can lead to considerable bias if done on pre-averaged data. The chosen solution is to treat the outcome as time-invariant within each year (a pratical assumption shared by the analysis model), and to use the mean of the subplots as a site-level summary. Both of these choices are widely accepted [@sterne2009; @white2011; @audigier2018].
+
+```{r}
+# average the "regional pool" SES-FD at a site level
+FD_avg <- results_sites |> 
+  group_by(year, site) |>
+  select(!subplot) |> 
+  summarise(across(everything(), mean), .groups = "drop")
+
+# refer weather to survey
+weat_imp <- weat_imp |> 
+  full_join(dates, relationship = "one-to-one") |>
+  #join FD
+  left_join(FD_avg, by = join_by(survey_year == year, site)) |> 
+  relocate(survey_year:below, .after = month)
+```
+
+The resulting tibble contains weather from years without a vegetation survey, which can be useful for imputation, but also years of vegetation surveys without any weather data. These can be removed.
+
+```{r}
+exclude <- weat_imp |> 
+  filter(!is.na(survey_year)) |> # survey years
+  group_by(site, survey_year) |> 
+  # those that have 12 months of NA in all variables
+  summarise(across(air_t_mean_OFD:wind_speed_max_ITP, \(x) sum(is.na(x))), .groups = "drop") |> 
+  filter(if_all(air_t_mean_OFD:wind_speed_max_ITP, \(x) x == 12))
+
+weat_imp <- weat_imp |> 
+  anti_join(exclude |> select(site, survey_year)) |> 
+  mutate(across(c(site, survey_year, year, month), as_factor))
+```
+
+## Proportion of missing data before imputation
+
+For the three variables of interest, the percent of missing monthly data, considering only the months associated with a survey and excluding 04-CAM1, a site with no ITP data, is:
+
+```{r}
+weat_imp |> 
+  semi_join(dates |> 
+                select(site, survey_year) |> 
+                mutate(across(everything(), as_factor))) |> 
+  filter_out(site == "04-CAM1") |> 
+  summarise(across(c(air_t_mean_ITP, soil_t_mean_ITP, precipitation_ITP), \(x) sum(is.na(x) / length(x) * 100)))
+```
+
+## Variables for imputation
+
+The following patterns show that when means are missing, so are minima and maxima, so they are not useful for imputation:
+
+```{r}
+#air T
+weat_imp |> 
+  select(air_t_mean_OFD:air_t_max_ITP) |> 
+  plot_pattern(rotate = T)
+
+#soil T
+weat_imp |> 
+  select(soil_t_mean_OFD:soil_t_max_ITP) |> 
+  plot_pattern(rotate = T)
+
+#solar radiation
+weat_imp |> 
+  select(solar_radiation_mean_OFD:solar_radiation_max_ITP) |> 
+  plot_pattern(rotate = T) # completely missing for ITP
+
+#relative humidity
+weat_imp |> 
+  select(relative_humidity_mean_OFD:relative_humidity_max_ITP) |> 
+  plot_pattern(rotate = T)
+
+#wind speed
+weat_imp |> 
+  select(wind_speed_mean_OFD:wind_speed_max_ITP) |> 
+  plot_pattern(rotate = T) # completely missing for ITP
+
+#remove min and max columns
+weat_imp <- weat_imp |> 
+  select(!contains(c("min", "max"))) |> 
+#remove empty columns
+  select(!c(solar_radiation_mean_ITP, wind_speed_mean_ITP))
+```
+
+Influx and outflux patterns. Variables with high influx are easier to impute, variable with high outflux are more useful to impute other variables. As expected, OFD variables have higher outflux because missingness is generally lower.
+
+```{r}
+flux(weat_imp[-1:-7]) |> 
+  select(c(influx, outflux)) |> 
+  rownames_to_column() |> 
+  ggplot(aes(x = influx, y = outflux))+
+  geom_point()+
+  geom_text_repel(aes(label = rowname))+
+  annotate("segment", x = 0, y = 1, xend = 1, yend = 0)+
+  lims(x = c(-0.5,1), y = 0:1)
+```
+
+The following correlation plot reveals an interesting pattern: there are two blocks of related variables, temperature/radiation and humidity/precipitation. Wind speed doesn't seem to be related to anything, and it's not used in the analysis models. This informs the selection of which variables to use in the imputation models.
+
+```{r}
+plot_corr(weat_imp[-1:-7], rotate = T, diagonal = T)
+
+weat_imp <- weat_imp |> 
+  select(!wind_speed_mean_OFD)
+
+# identify variable blocks
+temp_vars <- colnames(weat_imp)[8:12]
+
+hum_vars <- colnames(weat_imp)[13:16]
+```
+
+The ideal case is having OFD data for missing ITP variables of the same block. This happens most of the times. It is also possible to exclude observations with all variables in a block missing.
+
+```{r}
+#| fig-asp: 3.5
+
+#temperature
+weat_imp |> 
+  nest(.by = site) |> 
+  deframe() |> 
+  imap(\(data, site_name) data |> 
+        select(any_of(c("year", "cover", "month", temp_vars))) |> 
+        plot_pattern(rotate = T) +
+        ggtitle(site_name)) |> 
+  patchwork::wrap_plots(ncol = 1)
+
+#precipitation
+weat_imp |> 
+  nest(.by = site) |> 
+  deframe() |> 
+  imap(\(data, site_name) data |> 
+        select(any_of(c("year", "cover", "month", hum_vars))) |> 
+        plot_pattern(rotate = T) +
+        ggtitle(site_name)) |> 
+  patchwork::wrap_plots(ncol = 1)
+```
+
+## Imputation proper
+
+Next, we set up the imputation. We are using site as predictor: even if some levels are excluded for some outcomes, for lack of sufficient data in that site (especially 04-CAM1), it is better than ignoring it completely.
+
+```{r}
+# select outcome depending on analysis model (overall, aboveground, below) and generate separate imputations
+
+imp_above <- weat_imp |> 
+  select(site:survey_year, above, air_t_mean_OFD:cover)
+
+imp_below <- weat_imp |> 
+  select(site:survey_year, below, air_t_mean_OFD:cover)
+
+imp_overall <- weat_imp |> 
+  select(site:survey_year, overall, air_t_mean_OFD:cover)
+
+# don't impute survey_year, this variable is just for later
+
+method_ab <- make.method(imp_above)
+method_ab["survey_year"] <- ""
+
+method_bl <- make.method(imp_below)
+method_bl["survey_year"] <- ""
+
+method_oa <- make.method(imp_overall)
+method_oa["survey_year"] <- ""
+
+#make predictor matrix
+predmat_ab <- imp_above |> 
+  quickpred(include = c("above", "month"), exclude = "survey_year")
+
+#exclude outcomes which are not imputed for clarity
+predmat_ab[which(method_ab == ""),] <- 0
+
+#plot
+plot_pred(predmat_ab, rotate = T)
+
+#copy for other FDs
+predmat_bl <- predmat_oa <- predmat_ab
+
+colnames(predmat_bl)[5] <- "below"
+rownames(predmat_bl)[5] <- "below"
+
+colnames(predmat_oa)[5] <- "overall"
+rownames(predmat_oa)[5] <- "overall"
+```
+
+```{r}
+imp_above <- imp_above |> 
+  mice(predictorMatrix = predmat_ab,
+       method = method_ab,
+       m = 5, maxit = 100,
+       seed = 8274, printFlag = F)
+
+imp_below <- imp_below |> 
+   mice(predictorMatrix = predmat_bl,
+        method = method_bl,
+        m = 5, maxit = 100,
+        seed = 8274, printFlag = F)
+
+imp_overall <- imp_overall |> 
+   mice(predictorMatrix = predmat_oa,
+        method = method_oa,
+        m = 5, maxit = 100,
+        seed = 8274, printFlag = F)
+
+#complete and keep only data corresponding to FD surveys
+complete_above <- complete(imp_above, action = "long") |> 
+  semi_join(dates |> mutate(across(everything(), as_factor)))
+
+complete_below <- complete(imp_below, action = "long") |> 
+  semi_join(dates |> mutate(across(everything(), as_factor)))
+
+complete_overall <- complete(imp_overall, action = "long") |> 
+  semi_join(dates |> mutate(across(everything(), as_factor)))
+
+```
+
+## Imputation diagnostics
+
+Check for NAs, convergence, differences between imputations, imputed against observed data. Since there is heterogeneity in months, the latter is done by month.
+
+```{r}
+#plotting functions
+#box plot
+bwplot_imp <- function(data, vars) {
+  map(vars, 
+      ~ {
+        ggmice(data, aes(x = .imp, y = .data[[.x]])) +
+          geom_boxplot() +
+          labs(x = "Imputation number")
+      }
+  ) |> 
+    patchwork::wrap_plots()&
+    theme(legend.position = "none")
+}
+
+#density plot
+densplot_imp <- function(data, vars) {
+  map(vars, 
+      ~ {
+        ggmice(data, aes(x = .data[[.x]], group = .imp, size = .where)) +
+          geom_density()+
+          scale_size_manual(
+            values = c("observed" = 1, "imputed" = 0.5),
+            guide = "none")+
+          facet_wrap(~month,
+                     ncol = 3,
+                     strip.position = "right",
+                     scales = "free_y",
+                     dir = "v")+
+          theme(strip.text = element_text(size = 8))+
+          ggtitle("month")
+      }) |> 
+    patchwork::wrap_plots(guides = "collect", ncol = 1)&
+    theme(legend.position = "bottom")
+}
+
+#convergence plot
+convplot_imp <- function(data, dia = psrf){
+  convergence(data) |> 
+    filter_out(is.na({{dia}})) |> 
+    ggplot(aes(x = .it, y = {{dia}})) +
+    geom_line() +
+    geom_hline(yintercept = 1, linetype = 2, alpha = 0.5) +
+    facet_wrap(~vrb)
+}
+
+# outcome variables 
+to_plot <- c("air_t_mean_ITP", "soil_t_mean_ITP", "precipitation_ITP", "relative_humidity_mean_ITP")
+```
+
+### Aboveground
+
+```{r}
+#above
+complete_above |>
+  summarise(across(everything(), ~ sum(is.na(.x))))
+
+plot_trace(imp_above) +
+  theme(strip.text.y.left = element_text(size = 8, angle = 0))
+
+convplot_imp(imp_above)
+
+bwplot_imp(imp_above, to_plot)
+```
+
+```{r}
+#| fig-asp: 3
+densplot_imp(imp_above, to_plot)
+```
+
+### Belowground
+
+```{r}
+#below
+complete_below |> 
+  select(!survey_year) |> 
+  summarise(across(everything(), ~ sum(is.na(.x))))
+
+plot_trace(imp_below) +
+  theme(strip.text.y.left = element_text(size = 8, angle = 0))
+
+convplot_imp(imp_below)
+
+bwplot_imp(imp_below, to_plot)
+```
+
+```{r}
+#| fig-asp: 3
+densplot_imp(imp_below, to_plot)
+```
+
+### Overall
+
+```{r}
+#overall
+complete_overall |> 
+  select(!survey_year) |> 
+  summarise(across(everything(), ~ sum(is.na(.x))))
+
+plot_trace(imp_overall) +
+  theme(strip.text.y.left = element_text(size = 8, angle = 0))
+
+convplot_imp(imp_overall)
+
+bwplot_imp(imp_overall, to_plot)
+```
+
+```{r}
+#| fig-asp: 3
+densplot_imp(imp_overall, to_plot)
+```
+
+# Plot weather data
+
+## Open-field data
+
+```{r}
+complete_OFD |> 
+  imap(\(x, idx) x |> 
+         rename(value = matches(idx))) |> 
+  bind_rows(.id = "variable") |> 
+  ggplot(aes(x = survey_year, y = value, color = site))+
+  geom_point()+
+  geom_smooth(method = "lm", se = F, linewidth = 0.5)+
+  scale_x_continuous(limits = c(2001, 2011),
+                     breaks = scales::breaks_width(1))+
+  facet_wrap(~variable, ncol = 3, scales = "free_y")+
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+## Sub-canopy data
+
+Here are the annual means for each of the multiple imputations. It is clear that there is much more uncertainty for 04-CAM1, the site with more missing data. Using the multiply imputed datasets will reflect this uncertainty in the analysis.
+
+```{r}
+plot_complete <- function(x){
+  x |> 
+    select(c(site, survey_year, .imp, .id, contains("ITP"))) |> 
+    mutate(survey_year = as.numeric(levels(survey_year)[survey_year])) |> 
+    group_by(site, survey_year, .imp) |> 
+    summarise(across(everything(), mean), .groups = "drop") |>
+    mutate(precipitation_ITP = precipitation_ITP * 12) |> 
+    pivot_longer(contains("ITP"), names_to = "variable", values_to = "value") |> 
+    ggplot(aes(x = survey_year, y = value, color = site))+
+    geom_point()+
+    geom_smooth(method = "lm", se = F, linewidth = 0.5)+
+    scale_x_continuous(limits = c(2000, 2011),
+                     breaks = scales::breaks_width(1))+
+    facet_wrap(~variable, scales = "free_y")+
+    theme(axis.text.x = element_text(angle = 90))
+}
+
+complete_above |> 
+  plot_complete() +
+  ggtitle("Multiple imputations for aboveground FD analysis")
+
+complete_below |> 
+  plot_complete() +
+  ggtitle("Multiple imputations for belowground FD analysis")
+  
+complete_overall |> 
+  plot_complete() +
+  ggtitle("Multiple imputations for overall FD analysis")
+```
+
+## Plot ITP vs. OFD
+
+It would be interesting to see the correlation between imputed OFD and ITP data at the monthly level:
+
+```{r}
+vars <- str_remove(to_plot, "_ITP")
+
+cors <- map_dbl(vars, \(x) imp_overall |> 
+                 miceadds::micombine.cor(c(paste0(x,"_OFD"), paste0(x,"_ITP"))) |> 
+                 pluck("r",1)
+)
+
+cors <- tibble(variable = vars, cor = cors) |> 
+  mutate(cor = paste("r =", round(cors, digits = 2)))
+
+pairs <- complete(imp_overall, action = "long") |> 
+  select(!c(overall, cover, solar_radiation_mean_OFD)) |>
+  pivot_longer(ends_with("ITP") | ends_with("OFD"), names_to = c("variable", "type"),
+               names_pattern = "(.*)_(.*)", values_to = "value") |> 
+  pivot_wider(names_from = "type", values_from = "value")
+
+pairs |> 
+  ggplot(aes(x = OFD, y = ITP)) +
+  geom_point(aes(color = site)) +
+  geom_smooth(method = "lm", se = F)+
+  facet_wrap(~variable, scales = "free")+
+  geom_text(data = cors,
+            aes(x = -Inf, y = Inf, label = cor),
+            hjust = -0.1,
+            vjust = 1.1,
+            inherit.aes = FALSE)
+```
+
+# Correlations, MA regressions, and SD ratios
+
+To evaluate the extent to which air temperature and precipitation measured by sub-canopy stations are different from open-field measurements (for example, lower because of buffering and stemflow), I use correlations, major axis regressions and SD ratios, pooling the results across the imputations.
+
+```{r}
+cor_pool <- function(dat, var1, var2){
+  imp_overall |> 
+    miceadds::micombine.cor(c(var1, var2)) |> 
+    slice(1) |> 
+    select(est = r, lo = lower95, hi = upper95)
+  }
+
+sdratio_pool <- function(dat, var1, var2){
+  pooled <- dat |>
+    complete(action = "long") |> 
+    summarise(q_lsd = log(sd(.data[[var1]]) / sd(.data[[var2]])),
+              u_lsd = (1 - cor(.data[[var1]], .data[[var2]])^2) / (n() - 1),
+              .by = .imp) |>
+    with(pool.scalar(q_lsd, u_lsd))
+
+  est <- pooled$qbar
+  int <- 2*sqrt(pooled$t)
+
+  tibble(est = est, lo = est - int, hi = est + int) |> 
+    exp()
+}
+
+MA_pool <- function(dat, var1, var2){
+  form <- as.formula(str_c(var1, "~", var2))
+  pooled <- dat |> 
+    complete(action = "all") |> 
+    map(\(x) suppressMessages(lmodel2(form, x)) |> 
+          broom::tidy() |> 
+          filter(method == "MA" & term == "Slope") |> 
+          mutate(var = (mean(c(conf.high - estimate,
+                             estimate - conf.low))/2)^2)) |> 
+  bind_rows() |> 
+    with(pool.scalar(estimate, var))
+  
+  est <- pooled$qbar
+  int <- 2*sqrt(pooled$t)
+
+  tibble(est = est, lo = est - int, hi = est + int)
+}
+```
+
+The following table reports correlations, SD ratios and MA slopes with approximate 95% CIs:
+
+```{r}
+itp_ofd <- tibble(var = c("air_t_mean", "precipitation"),
+       vars = map(var, \(x) c(str_c(x, "_ITP"), str_c(x, "_OFD")))) |> 
+  mutate(r = map(vars, \(x) cor_pool(imp_overall, x[1], x[2])),
+         `SD ratio` = map(vars, \(x) sdratio_pool(imp_overall, x[1], x[2])),
+         `MA slope` = map(vars, \(x) MA_pool(imp_overall, x[1], x[2])),
+         var = recode_values(var,
+                             "air_t_mean" ~ "Mean air temperature",
+                             "precipitation" ~ "Precipitation")) |> 
+  select(!vars) |> 
+  pivot_longer(r:`MA slope`) |> 
+  unnest_wider(value) |> 
+  mutate(across(est:hi, \(x) round(x, 2)),
+         out = str_c(est, " (", lo, "–", hi, ")")) |> 
+  select(var, name, out) |> 
+  pivot_wider(names_from = name, values_from = out)
+
+itp_ofd
+
+write_csv(itp_ofd, "output/itp_ofd_comparison.csv")
+```
+
+# Save results
+
+```{r}
+#convert mids to list of dataframes, clean columns, calculate annual means
+finish_weat <- function(x, fd){
+  x |> 
+    #keep only data for FD survey years
+    semi_join(dates |> 
+                select(site, survey_year) |> 
+                mutate(across(everything(), as_factor))) |> 
+    #keep only weather variables
+    select(!any_of(c("month", "year", "cover", "above", "below", "overall"))) |> 
+    #calculate 12-month means for each survey
+    group_by(site, survey_year) |> 
+    summarise(across(everything(), mean), .groups = "drop") |> 
+    #precipitation multiplied by 12 because it's an extensive property
+    mutate(across(contains("precipitation"), \(x) x * 12)) |> 
+    rename(year = survey_year) |> 
+    #join FD outcome
+    inner_join(results_sites |> 
+                 select(all_of(c("year", "site", "subplot", fd))) |> 
+                 mutate(across(c(site, year), as_factor)),
+                        relationship = "one-to-many") |> 
+    #rearrange columns and pivot back to long
+    relocate(any_of(c("subplot", "above", "below", "overall")), .after = year) |> 
+    pivot_longer(5:last_col(),
+                 names_to = c(".value", "type"),
+                 names_sep = "_(?=[^_]+$)") |>
+    #OFD not needed here
+    filter_out(type == "OFD") |> 
+    # CAM has no observed ITP data, those should probably not be used in models
+    filter_out(site == "04-CAM1") |> 
+    #remove unnecessary columns
+    select(!c(type, solar_radiation_mean)) 
+}
+
+data_ITP_above <- complete(imp_above, action = "all") |> 
+  lapply(finish_weat, "above")
+
+data_ITP_below <- complete(imp_below, action = "all") |> 
+  lapply(finish_weat, "below")
+
+data_ITP_overall <- complete(imp_overall, action = "all") |> 
+  lapply(finish_weat, "overall")
+
+#join FD outcome for OFD
+data_OFD <- complete_OFD |> 
+  map(\(x) x|> 
+        mutate(across(c(site, survey_year), as_factor)) |>
+        inner_join(results_sites |> 
+                     mutate(across(c(site, year), as_factor)), 
+                   by = c("survey_year" = "year", "site" = "site"),
+                   relationship = "one-to-many") |> 
+        mutate(survey_year = fct_drop(survey_year)) |> 
+        rename(year = survey_year)
+  )
+
+
+#save
+save(data_OFD, data_ITP_above, data_ITP_below, data_ITP_overall, file = "intermediate/weather.RData")
+saveRDS(weat_imp_raw, "intermediate/weat.rds")
+saveRDS(dates, "intermediate/dates.rds")
+```
+
+# Session info
+
+```{r}
+#| echo: false
+sessioninfo::session_info()
+```

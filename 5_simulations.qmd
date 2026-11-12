@@ -1,0 +1,1122 @@
+---
+title: "Simulations"
+editor_options: 
+  chunk_output_type: console
+execute: 
+  message: false
+---
+
+# Setup
+
+```{r}
+#| warning: false
+
+library(conflicted)
+library(tidyverse)
+library(dagitty)
+library(tidybayes)
+library(distributional)
+library(brms)
+library(bayesplot)
+library(DT)
+
+source("functions.R")
+
+conflicts_prefer(dplyr::filter,
+                 tidyr::expand,
+                 stats::lag,
+                 distributional::parameters,
+                 brms::ar,
+                 brms::dstudent_t,
+                 brms::pstudent_t,
+                 brms::qstudent_t,
+                 brms::rstudent_t,
+                 brms::rhat)
+
+options(mc.cores = parallel::detectCores())
+options(brms.file_refit = "on_change")
+#install.packages("cmdstanr", repos = c('https://stan-dev.r-universe.dev', getOption("repos")))
+#check https://mc-stan.org/cmdstanr/
+#install.packages('hexbin')
+
+options(brms.backend = "cmdstanr")
+options(brms.plot_points = T)
+options(contrasts = c("contr.sum", "contr.poly"))
+options(digits = 3)
+
+if (!dir.exists("fits/sim")) dir.create("fits/sim", recursive = T)
+
+theme_set(theme_minimal())
+
+```
+
+# Test the model with simulated data
+
+## Create simulated data
+
+The simulated data follows a generative model based on the DAG, with the same data structure of the actual data. Each site has a group mean of two weather variables (e.g. temperature, precipitation) and annual fluctuations. FD is related to temperature and precipitation.
+There are two unobserved confounds: U1, which is time-invariant, and U2, which is not. U1 affects weather means and FD. An average SES below zero can result, for example, from habitat filtering together with species turnover, an average SES above zero from limiting similarity or within-site heterogeneity together with species turnover. U2 is a common cause of temperature and precipitation, which means that omitting either variable would result in confounding. The data are generated according to this DAG:
+
+```{r}
+#| echo: false
+dag <- dagitty("dag{
+               T -> FD;
+               P -> FD;
+               U1 -> T;
+               U1 -> P;
+               U1 -> FD;
+               U2 -> T;
+               U2 -> P
+               T [exposure]
+               P [exposure]
+               FD [outcome]
+               U1 [unobserved]
+               U2 [unobserved]}")
+
+coordinates(dag) <- list(x = c(T=-1, U1=0, U2=0, P=1, FD=0),
+                         y = c(U2=-1, U1=0, T=0, P=0, FD=1))
+
+plot(dag)
+```
+
+This is how the data are simulated. We choose to closely resemble the actual data structure, with 4 sites surveyed in at most 8 years, and a different amount of subplots in each site. In this example, the confound U1 has a positive effect on precipitation and FD (an increase in temperature causes an increase in FD, and sites with higher mean temperature have higher FD) and a negative effect on precipitation (sites with lower precipitation have lower FD). U2 has a positive effect on both temperature and precipitation. Since this example focuses on the ability of different models to recover the true effects, the effects are made larger than they probably are. For convenience, let's assume predictors have been already centered and scaled (the FD-SES outcome is by design).
+
+```{r}
+set.seed(126)
+
+#there are four sites
+n_sites <- 4
+#there are eight years
+n_years <- 8
+
+sites <- fct(LETTERS[1:n_sites])
+
+years <- seq_len(n_years)
+
+#sites have a different number of subplots, between 10 and 25
+subplots <- sample(10:25, length(sites), replace = T)
+
+sim <- tibble(site = rep(sites, times = subplots),
+              subplot = sequence(subplots))
+
+sim <- expand_grid(year = years, sim)
+
+#parameters
+#the confound has mean 0 and SD 1
+u1_t <- 1 #effect of confound U1 on temperature
+u1_p <- -1 #effect of confound U1 on precipitation
+u1_y <-  1 #effect of confound U1 on outcome
+u2_t <- 0.5 #effect of confound U2 on temperature
+u2_p <- 0.5 #effect of confound U2 on precipitation
+weat_sd <- 0.5 #within-site yearly weather SD
+site_sd <- 1 #between-site variation
+u1_sd <- 1 #SD of time-invariant confound
+u2_sd <- 0.5 #SD of time-variant confound
+residual <- 0.5 #residual variation between subplots
+
+#simulation function
+# t_y effect of temp on FD
+# p_y effect of prec on FD
+# int_w within-site interaction between temp and prec
+# int_c1, int_c2 cross level interactions
+# int_b site-level interaction
+
+weat_sim <- function(x, t_y = 0, p_y = 0, int_w = 0, int_c1 = 0, int_c2 = 0, int_b = 0) {
+  x |>
+    #time-invariant components
+    mutate(u1 = rnorm(1, mean = 0, sd = u1_sd), # unobserved time-invariant confound
+           #site-level weather means
+           t_site = rnorm(1, mean = u1_t * u1, sd = site_sd),
+           p_site = rnorm(1, mean = u1_p * u1, sd = site_sd),
+           .by = site) |>
+    #each year has weather values, affected by the site means and the confounds
+    mutate(u2 = rnorm(1, mean = 0, sd = u2_sd), # time-varying confound between T and P
+           # within-site weather fluctuations
+           temp_w = rnorm(1, mean = u2_t * u2, sd = weat_sd),
+           prec_w = rnorm(1, mean = u2_p * u2, sd = weat_sd),
+           temp = temp_w + t_site,
+           prec = prec_w + p_site,
+           .by = c(site, year)) |> 
+    #FD-SES outcome affected by weather and confounds
+    mutate(FD = rnorm(n(), mean = t_y * temp +
+                                  p_y * prec +
+                                  int_w * temp_w * prec_w +
+                                  int_c1 * temp_w * p_site +
+                                  int_c2 * t_site * prec_w +
+                                  int_b * t_site * p_site +
+                                  u1_y * u1,
+                      sd = residual)) |> 
+    #auxiliary variables
+    mutate(t_mean = mean(temp),
+           p_mean = mean(prec),
+           t_cent = temp - t_mean,
+           p_cent = prec - p_mean,
+           t_x_p = t_cent * p_cent - mean(t_cent * p_cent),
+           .by = site)
+}
+```
+
+## Models without interaction
+
+Three scenarios represent an increase, decrease or no change in FD-SES with a within-site increase in temperature, while the effect of precipitation is always negative.
+
+### Positive effect
+
+Both temperature and confound have a positive effect of FD:
+
+```{r}
+set.seed(20)
+
+sim_pos <- sim |> 
+  weat_sim(t_y = 1, p_y = -0.5)
+
+sim_pos |> 
+  ggplot(aes(x = site, y = temp, fill = site))+
+  geom_boxplot()
+
+sim_pos |> 
+  ggplot(aes(x = temp, y = FD))+
+  geom_point(aes(color = site))+
+  geom_smooth(method = "lm", se = F)+
+  geom_smooth(aes(color = site),method = "lm", se = F)
+```
+
+### Zero effect
+
+In the second, the estimated effect is 0, there is only confounding:
+
+```{r}
+set.seed(20)
+
+sim_nul <- sim |> 
+  weat_sim(t_y = 0, p_y = -0.5)
+
+sim_nul |> 
+  ggplot(aes(x = site, y = temp, fill = site))+
+  geom_boxplot()
+
+sim_nul |> 
+  ggplot(aes(x = temp, y = FD))+
+  geom_point(aes(color = site))+
+  geom_smooth(method = "lm", se = F)+
+  geom_smooth(aes(color = site),method = "lm", se = F)
+```
+
+### Negative effect
+
+In the third, the estimated effect is -1, contrasting the confound:
+
+```{r}
+set.seed(20)
+
+sim_neg <- sim |> 
+  weat_sim(t_y = -1, p_y = -0.5)
+
+sim_neg |> 
+  ggplot(aes(x = site, y = temp, fill = site))+
+  geom_boxplot()
+
+sim_neg |> 
+  ggplot(aes(x = temp, y = FD))+
+  geom_point(aes(color = site))+
+  geom_smooth(method = "lm", se = F)+
+  geom_smooth(aes(color = site),method = "lm", se = F)
+```
+
+# Prior choice
+
+Default priors can be too wide, and the prior for $\beta$ is an improper flat prior. Let's find more reasonable priors.
+
+```{r}
+default_prior(FD ~ t_cent + p_cent + site, data = sim_pos)
+```
+
+## Intercept
+
+Brms defines the intercept as the value of the outcome with all predictors at their mean. This is *not* the "b_Intercept" shown in the model output, but rather the internal "Intercept" parameter. In this simulation it is zero, but we should allow variation while considering that FD-SES should be usually within (-2, 2). Let's check a default prior:
+
+```{r}
+ggplot()+
+  stat_halfeye(aes(xdist = dist_student_t(3, 0, 2.5)),
+    fill = "khaki1", .width = c(0.66, 0.95))+
+  scale_y_continuous(NULL, breaks = NULL)+
+  ggtitle("Default prior for intercept")
+```
+
+The overdispersion is worth keeping, but the prior is still too wide. Here's a better prior:
+
+```{r}
+ggplot()+
+  stat_halfeye(aes(xdist = dist_student_t(3, 0, 0.7)),
+    fill = "seagreen1", .width = c(0.66, 0.95))+
+  scale_y_continuous(NULL, breaks = NULL)+
+  ggtitle("Adjusted prior for intercept")
+```
+
+## Beta coefficients
+
+Large effects of weather on FD, but in this case also for the fixed effect of site, are unlikely. A weakly regularizing prior would still allow large effects, but most of the parameter probability is restricted to values closer to 0. The prior for $\beta$ in this simulation allows for effects twice as large as the true effects in any direction.
+
+```{r}
+ggplot()+
+  stat_halfeye(aes(xdist = dist_normal(0, 1)),
+    fill = "lightsalmon", .width = c(0.66, 0.95))+
+  scale_y_continuous(NULL, breaks = NULL)+
+  ggtitle(expression("Prior for"~beta))
+```
+
+## Standard deviations
+
+Next, the default prior for residual standard deviations is a half-t. This prior is evidently too flat, allowing variations higher than possible.
+
+```{r}
+ggplot()+
+  stat_halfeye(aes(xdist = dist_truncated(dist_student_t(3, 0, 2.5), lower = 0)),
+                fill = "violet", .width = c(0.66, 0.95))+
+  scale_y_continuous(NULL, breaks = NULL)+
+  ggtitle(expression("Default prior for"~sigma))
+```
+
+Here is instead, a more reasonable prior. Standard deviations of the outcome for residuals should be between 0 and 1, but higher values are allowed.
+
+```{r}
+ggplot()+
+  stat_halfeye(aes(xdist = dist_truncated(dist_student_t(3, 0, 0.5), lower = 0)),
+                fill = "steelblue1", .width = c(0.66, 0.95))+
+  scale_y_continuous(NULL, breaks = NULL)+
+  ggtitle(expression("Adjusted prior for"~sigma))
+```
+
+## Storing the priors
+
+```{r}
+prior <- c(prior(student_t(3, 0, 0.7), class = "Intercept"),
+           prior(normal(0, 1), class = "b"),
+           prior(student_t(3, 0, 0.5), class = "sigma", lb = 0))
+```
+
+# Plotting function
+
+```{r}
+#plots the posterior distribution of weather
+coefplot <- function(x, vline, lims, pars = "b_temp"){
+  mcmc_areas(x, pars = pars)+
+  vline_at(vline, linetype = 2)+
+  scale_x_continuous(limits = lims)+
+  coord_cartesian(ylim = c(NA,1.05))
+}
+```
+
+Intercept is an internal centered intercept, should not be shown together with b_Intercept <https://discourse.mc-stan.org/t/b-intercept-and-intercept-how-are-they-related/12933>. For diagnostics, the centered intercept is more useful, since the noncentered one is usually correlated with the slope.
+
+```{r}
+show <- vars(!c(lprior, lp__, b_Intercept))
+
+hide <- c("lprior", "lp__", "b_Intercept")
+```
+
+# Models without interactions
+
+## Confounded model ignoring site
+
+Ignoring site completely shows a confounded effect of weather. This would be the blue regression line in the previous plots. The true effect is shown by a vertical line. It is clear that the time-invariant confound biases the effects, upward for temperature and downward for precipitation (which is fixed at 0).
+
+```{r}
+fit_conf_pos <- brm(FD ~ temp + prec, 
+                    data = sim_pos,
+                    prior = prior,
+                    file = "fits/sim/sim.conf.pos",
+                    seed = 295)
+
+fit_conf_pos
+
+mcmc_intervals(fit_conf_pos, pars = show)
+
+fit_conf_pos |> 
+  coefplot(1, c(0.5, 2))
+
+fit_conf_pos |> 
+  coefplot(-0.5, c(-2, 0), pars = "b_prec")
+```
+
+```{r}
+fit_conf_nul <- update(fit_conf_pos,
+                       newdata = sim_nul,
+                       file = "fits/sim/sim.conf.nul",
+                       seed = 295)
+  
+fit_conf_nul
+
+mcmc_intervals(fit_conf_nul, pars = show)
+
+fit_conf_nul |> 
+  coefplot(0, c(-0.5, 1.5))
+
+fit_conf_nul |> 
+  coefplot(-0.5, c(-2, 0), pars = "b_prec")
+```
+
+```{r}
+fit_conf_neg <- update(fit_conf_pos,
+                       newdata = sim_neg,
+                       file = "fits/sim/sim.conf.neg",
+                       seed = 295)
+
+fit_conf_neg
+
+mcmc_intervals(fit_conf_neg, pars = show)
+
+fit_conf_neg |> 
+  coefplot(-1, c(-1.5, 0.5))
+
+fit_conf_neg |> 
+  coefplot(-0.5, c(-2, 0), pars = "b_prec")
+```
+
+## Fixed-effects model
+
+A common solution is to include the cluster variable as fixed effect. In this case, "site" absorbs all time-invariant differences between sites, observed or unobserved.
+
+```{r}
+fit_fix_pos <- brm(FD ~ temp + prec + site,
+                   data = sim_pos,
+                   prior = prior,
+                   file = "fits/sim/sim.fix.pos",
+                   seed = 295)
+
+fit_fix_pos
+
+mcmc_intervals(fit_fix_pos, pars = show)
+
+fit_fix_pos |> 
+  coefplot(1, c(0, 1.5))
+
+fit_fix_pos |> 
+  coefplot(-0.5, c(-1, 1), pars = "b_prec")
+```
+
+```{r}
+fit_fix_nul <- update(fit_fix_pos,
+                      newdata = sim_nul,
+                      file = "fits/sim/sim.fix.nul",
+                      seed = 295)
+
+fit_fix_nul
+
+mcmc_intervals(fit_fix_nul, pars = show)
+
+fit_fix_nul |> 
+  coefplot(0, c(-0.5, 0.5))
+
+fit_fix_nul |> 
+  coefplot(-0.5, c(-1, 1), pars = "b_prec")
+```
+
+```{r}
+fit_fix_neg <- update(fit_fix_pos,
+                      newdata = sim_neg,
+                      file = "fits/sim/sim.fix.neg",
+                      seed = 295)
+
+fit_fix_neg
+
+mcmc_intervals(fit_fix_neg, pars = show)
+
+fit_fix_neg |> 
+  coefplot(-1, c(-1.5, 0))
+
+fit_fix_neg |> 
+  coefplot(-0.5, c(-1, 1), pars = "b_prec")
+```
+
+## Naive multilevel model
+
+A naive multilevel model without mean centering recovers a single slope which is a mix of the "within" and the "between" effects [@hamaker2020]. This could bias the estimate of the effect. The model doesn't sample great, and there is high uncertainty about the between-site variation (probably because there are only 4 sites), so partial pooling is minimal and the results are close to the fixed-effects models in this case.
+
+```{r}
+prior_re <- c(prior, prior(student_t(3, 0, 0.5), class = "sd", lb = 0))
+
+fit_naive_pos <- brm(FD ~ temp + prec + (1|site),
+                     data = sim_pos,
+                     prior = prior_re,
+                     file = "fits/sim/sim.nai.pos",
+                     seed = 295,
+                     control = list(adapt_delta = 0.99))
+
+fit_naive_pos
+
+my_mcmc_pairs(fit_naive_pos)
+
+mcmc_intervals(fit_naive_pos, pars = show)
+
+fit_naive_pos |> 
+  coefplot(1, c(0, 1.5))
+
+fit_naive_pos |> 
+  coefplot(-0.5, c(-1, 0.5), pars = "b_prec")
+```
+
+```{r}
+fit_naive_nul <- update(fit_naive_pos,
+                        newdata = sim_nul,
+                        file = "fits/sim/sim.nai.nul",
+                        seed = 295)
+
+fit_naive_nul
+
+mcmc_intervals(fit_naive_nul, pars = show)
+
+fit_naive_nul |> 
+  coefplot(0, c(-0.5, 1))
+
+fit_naive_nul |> 
+  coefplot(-0.5, c(-1, 0.5), pars = "b_prec")
+```
+
+```{r}
+fit_naive_neg <- update(fit_naive_pos,
+                        newdata = sim_neg,
+                        file = "fits/sim/sim.nai.neg",
+                        seed = 295)
+
+fit_naive_neg
+
+mcmc_intervals(fit_naive_neg, pars = show)
+
+fit_naive_neg |> 
+  coefplot(-1, c(-1.5, 0))
+
+fit_naive_neg |> 
+  coefplot(-0.5, c(-1, 0.5), pars = "b_prec")
+```
+
+## Mundlak contextual model
+
+The Mundlak model adjusts for the group-level (site) mean to account for group-level confounding [@mundlak1978]. It will recover two coefficients, one the true within-site effect, one the contextual effect, a confounded effect representing the influence of being in a different site with the same temperature, that is the difference in between- and within-site slopes.
+
+```{r}
+fit_mund_pos <- brm(FD ~ temp + t_mean + prec + p_mean + (1|site),
+                    data = sim_pos,
+                    prior = prior_re,
+                    file = "fits/sim/sim.mund.pos",
+                    seed = 295,
+                    control = list(adapt_delta = 0.99))
+
+fit_mund_pos
+
+mcmc_intervals(fit_mund_pos, pars = show)
+
+fit_mund_pos |> 
+  coefplot(1, c(0, 2))
+
+fit_mund_pos |> 
+  coefplot(-0.5, c(-1, 0.5), pars = "b_prec")
+```
+
+```{r}
+fit_mund_nul <- update(fit_mund_pos,
+                       newdata = sim_nul,
+                       file = "fits/sim/sim.mund.nul",
+                       seed = 295)
+
+fit_mund_nul
+
+mcmc_intervals(fit_mund_nul, pars = show)
+
+fit_mund_nul |> 
+  coefplot(0, c(-0.5, 0.5))
+
+fit_mund_nul |> 
+  coefplot(-0.5, c(-1, 0.5), pars = "b_prec")
+```
+
+```{r}
+fit_mund_neg <- update(fit_mund_pos,
+                       newdata = sim_neg,
+                       file = "fits/sim/sim.mund.neg",
+                       seed = 295)
+
+fit_mund_neg
+
+mcmc_intervals(fit_mund_neg, pars = show)
+
+fit_mund_neg |> 
+  coefplot(-1, c(-1.5, 0))
+
+fit_mund_neg |> 
+  coefplot(-0.5, c(-1, 0.5), pars = "b_prec")
+```
+
+## Mean centering
+
+This approach, similar to the contextual model, instead subtracts the mean from within-site predictor. The coefficients represent the between- and the within-site slopes.
+
+```{r}
+fit_cent_pos <- brm(FD ~ t_cent + t_mean + p_cent + p_mean + (1|site),
+                    data = sim_pos,
+                    prior = prior_re,
+                    file = "fits/sim/sim.cent.pos",
+                    seed = 295,
+                    control = list(adapt_delta = 0.99))
+
+fit_cent_pos
+
+mcmc_intervals(fit_cent_pos, pars = show)
+
+fit_cent_pos |> 
+  coefplot(1, c(0, 2), "b_t_cent")
+
+fit_cent_pos |> 
+  coefplot(-0.5, c(-1, 0.5), "b_p_cent")
+```
+
+```{r}
+fit_cent_nul <- update(fit_cent_pos,
+                       newdata = sim_nul,
+                       file = "fits/sim/sim.cent.nul",
+                       seed = 295)
+
+fit_cent_nul
+
+mcmc_intervals(fit_cent_nul, pars = show)
+
+fit_cent_nul |> 
+  coefplot(0, c(-0.5, 0.5), "b_t_cent")
+
+fit_cent_nul |> 
+  coefplot(-0.5, c(-1, 0.5), "b_p_cent")
+```
+
+```{r}
+fit_cent_neg <- update(fit_cent_pos,
+                       newdata = sim_neg,
+                       file = "fits/sim/sim.cent.neg",
+                       seed = 295)
+
+fit_cent_neg
+
+mcmc_intervals(fit_cent_neg, pars = show)
+
+fit_cent_neg |> 
+  coefplot(-1, c(-1.5, 0), "b_t_cent")
+
+fit_cent_neg |> 
+  coefplot(-0.5, c(-1, 0.5), "b_p_cent")
+```
+
+## Latent Mundlak
+
+The site-level means are not known. Using a latent mean approach instead of the empirical means respects this uncertainty. There is more than one way to implement this model in brms <https://rubenarslan.github.io/posts/2023-03-11-latent-group-mean-centering-revisited> <https://vuorre.com/posts/latent-mean-centering/>.
+
+### Measurement error
+
+```{r}
+sim_pos <- sim_pos |> 
+  mutate(temp_se = sd(temp)/sqrt(n()),
+         prec_se = sd(prec)/sqrt(n()),
+         .by = site)
+
+sim_nul <- sim_nul |> 
+  mutate(temp_se = sd(temp)/sqrt(n()),
+         prec_se = sd(prec)/sqrt(n()),
+         .by = site)
+
+sim_neg <- sim_neg |> 
+  mutate(temp_se = sd(temp)/sqrt(n()),
+         prec_se = sd(prec)/sqrt(n()),
+         .by = site)
+```
+
+We express the site mean as measured with error with the `me()` syntax:
+
+```{r}
+lat_formula_me <- bf(FD ~ me(t_mean, temp_se, gr = site) + temp +
+                          me(p_mean, prec_se, gr = site) + prec + (1|site))
+
+get_prior(lat_formula_me, data = sim_pos)
+
+lat_prior_me <- c(prior(student_t(3, 0, 0.7), class = "Intercept"),
+                  prior(normal(0, 1), class = "b"),
+                  prior(student_t(5, 0, 1), class = "sd", lb = 0),
+                  prior(normal(0, 1), class = "sdme", lb = 0),
+                  prior(student_t(5, 0, 1), class = "sigma", lb = 0))
+```
+
+```{r}
+fit_lat_me_pos <- brm(lat_formula_me,
+                      data = sim_pos,
+                      prior = lat_prior_me,
+                      file = "fits/sim/sim.lat.me.pos",
+                      save_model = "fits/sim/sim.lat.me.pos.txt",
+                      seed = 295,
+                      control = list(adapt_delta = 0.9))
+
+fit_lat_me_pos
+
+mcmc_intervals(fit_lat_me_pos, pars = vars(!c(hide, matches("me"))))
+
+fit_lat_me_pos |> 
+  coefplot(1, c(0, 1.5))
+
+fit_lat_me_pos |> 
+  coefplot(-0.5, c(-1, 0.5), "b_prec")
+```
+
+```{r}
+fit_lat_me_nul <- update(fit_lat_me_pos,
+                         newdata = sim_nul,
+                         file = "fits/sim/sim.lat.me.nul",
+                         seed = 295)
+
+fit_lat_me_nul
+
+mcmc_intervals(fit_lat_me_nul, pars = vars(!c(hide, matches("me"))))
+
+fit_lat_me_nul |> 
+  coefplot(0, c(-0.5, 1))
+
+fit_lat_me_nul |> 
+  coefplot(-0.5, c(-1, 0.5), "b_prec")
+```
+
+```{r}
+fit_lat_me_neg <- update(fit_lat_me_pos,
+                         newdata = sim_neg,
+                         file = "fits/sim/sim.lat.me.neg",
+                         seed = 295)
+
+fit_lat_me_neg
+
+mcmc_intervals(fit_lat_me_neg, pars = vars(!c(hide, matches("me"))))
+
+fit_lat_me_neg |> 
+  coefplot(-1, c(-1.5, 0))
+
+fit_lat_me_neg |> 
+  coefplot(-0.5, c(-1, 0.5), "b_prec")
+```
+
+Closer inspection of the Stan code for the models above reveals they might not be grouping the latent mean by site. This might be the main reason they differ from the ones below.
+
+### Missingness
+
+We duplicate the weather variable, then use the `mi()` notation, which is now favored over `me()`.
+
+```{r}
+sim_pos <- sim_pos |> 
+  mutate(temp2 = temp,
+         prec2 = prec)
+
+sim_nul <- sim_nul |> 
+  mutate(temp2 = temp,
+         prec2 = prec)
+
+sim_neg <- sim_neg |> 
+  mutate(temp2 = temp,
+         prec2 = prec)
+
+lat_formula_mi <- bf(FD ~ (1|site) + temp + mi(temp2) + prec + mi(prec2)) +
+                  bf(temp2 | mi(temp_se) ~ (1|site)) +
+                  bf(prec2 | mi(prec_se) ~ (1|site))
+
+get_prior(lat_formula_mi, data = sim_pos)
+
+lat_prior_mi <- c(prior(student_t(3, 0, 0.7), class = "Intercept", resp = "FD"),
+                  prior(normal(0, 1), class = "b", resp = "FD"),
+                  prior(student_t(3, 0, 0.5), class = "sd", lb = 0, resp = "FD"),
+                  prior(student_t(3, 0, 0.5), class = "sigma", lb = 0, resp = "FD"),
+                  prior(student_t(3, 0, 1), class = "sd", lb = 0, resp = "temp2"),
+                  prior(student_t(3, 0, 0.5), class = "sigma", lb = 0, resp = "temp2"),
+                  prior(student_t(3, 0, 1), class = "sd", lb = 0, resp = "prec2"),
+                  prior(student_t(3, 0, 0.5), class = "sigma", lb = 0, resp = "prec2"))
+```
+
+```{r}
+fit_lat_mi_pos <- brm(lat_formula_mi,
+                      data = sim_pos,
+                      prior = lat_prior_mi,
+                      file = "fits/sim/sim.lat.mi.pos",
+                      save_model = "fits/sim/sim.lat.mi.pos.txt",
+                      seed = 295,
+                      control = list(adapt_delta = 0.9))
+
+fit_lat_mi_pos
+
+mcmc_intervals(fit_lat_mi_pos, pars = vars(matches("_FD")))
+
+fit_lat_mi_pos |> 
+  coefplot(1, c(-2, 2.5), "b_FD_temp")
+
+fit_lat_mi_pos |> 
+  coefplot(-0.5, c(-2.5, 2), "b_FD_prec")
+```
+
+```{r}
+fit_lat_mi_nul <- update(fit_lat_mi_pos,
+                         newdata = sim_nul,
+                         file = "fits/sim/sim.lat.mi.nul",
+                         seed = 295)
+
+fit_lat_mi_nul
+
+mcmc_intervals(fit_lat_mi_nul, pars = vars(matches("_FD")))
+
+fit_lat_mi_nul |> 
+  coefplot(0, c(-2, 2), "b_FD_temp")
+
+fit_lat_mi_nul |> 
+  coefplot(-0.5, c(-2.5, 2), "b_FD_prec")
+```
+
+```{r}
+fit_lat_mi_neg <- update(fit_lat_mi_pos,
+                         newdata = sim_neg,
+                         file = "fits/sim/sim.lat.mi.neg",
+                         seed = 295)
+
+fit_lat_mi_neg
+
+mcmc_intervals(fit_lat_mi_neg, pars = vars(matches("_FD")))
+
+fit_lat_mi_neg |> 
+  coefplot(-1, c(-2.5, 2), "b_FD_temp")
+
+fit_lat_mi_neg |> 
+  coefplot(-0.5, c(-2.5, 2), "b_FD_prec")
+```
+
+## Model comparison
+
+The following visualization is inspired by Ruben Arslan's [post](https://rubenarslan.github.io/posts/2023-03-11-latent-group-mean-centering-revisited).
+
+The temperature coefficients:
+
+```{r}
+summary_t <- bind_rows(lst(
+          gather_draws(fit_conf_pos, b_temp),
+          gather_draws(fit_fix_pos, b_temp),
+          gather_draws(fit_naive_pos, b_temp),
+          gather_draws(fit_mund_pos, b_temp),
+          gather_draws(fit_cent_pos, b_t_cent),
+          gather_draws(fit_lat_me_pos, b_temp),
+          gather_draws(fit_lat_mi_pos, b_FD_temp),
+          gather_draws(fit_conf_nul, b_temp),
+          gather_draws(fit_fix_nul, b_temp),
+          gather_draws(fit_naive_nul, b_temp),
+          gather_draws(fit_mund_nul, b_temp),
+          gather_draws(fit_cent_nul, b_t_cent),
+          gather_draws(fit_lat_me_nul, b_temp),
+          gather_draws(fit_lat_mi_nul, b_FD_temp),
+          gather_draws(fit_conf_neg, b_temp),
+          gather_draws(fit_fix_neg, b_temp),
+          gather_draws(fit_naive_neg, b_temp),
+          gather_draws(fit_mund_neg, b_temp),
+          gather_draws(fit_cent_neg, b_t_cent),
+          gather_draws(fit_lat_me_neg, b_temp),
+          gather_draws(fit_lat_mi_neg, b_FD_temp)
+          ),
+          .id = "model") |> 
+  ungroup() |> 
+  mutate(model = str_remove_all(model, "gather_draws|\\(|\\)")) |> 
+  mutate(effect = str_extract(model, "(?<=_)[^_,]+(?=,|$)"),
+         model = str_extract(model, "(?<=_).*(?=,)")) |> 
+  mutate(model = str_extract(model, ".*(?=_)")) |> 
+  mutate(model = as_factor(model)) |> 
+  group_by(model, effect, .variable) |> 
+  mean_hdci(.width = c(0.5, 0.95))
+
+trueline <- tibble(x = -1:1,
+                   effect = c("neg", "nul", "pos"))
+
+summary_t |> 
+  ggplot(aes(y = model, x = .value, xmin = .lower, xmax = .upper)) +
+  geom_pointinterval() +
+  scale_y_discrete(limits = rev(levels(summary_t$model))) +
+  geom_vline(aes(xintercept = x), linetype = 2, data = trueline) +
+  facet_wrap(~ effect, scales = "free_x") +
+  labs(x = "coefficient")
+```
+
+The precipitation coefficients:
+
+```{r}
+summary_p <- bind_rows(lst(
+          gather_draws(fit_conf_pos, b_prec),
+          gather_draws(fit_fix_pos, b_prec),
+          gather_draws(fit_naive_pos, b_prec),
+          gather_draws(fit_mund_pos, b_prec),
+          gather_draws(fit_cent_pos, b_p_cent),
+          gather_draws(fit_lat_me_pos, b_prec),
+          gather_draws(fit_lat_mi_pos, b_FD_prec),
+          gather_draws(fit_conf_nul, b_prec),
+          gather_draws(fit_fix_nul, b_prec),
+          gather_draws(fit_naive_nul, b_prec),
+          gather_draws(fit_mund_nul, b_prec),
+          gather_draws(fit_cent_nul, b_p_cent),
+          gather_draws(fit_lat_me_nul, b_prec),
+          gather_draws(fit_lat_mi_nul, b_FD_prec),
+          gather_draws(fit_conf_neg, b_prec),
+          gather_draws(fit_fix_neg, b_prec),
+          gather_draws(fit_naive_neg, b_prec),
+          gather_draws(fit_mund_neg, b_prec),
+          gather_draws(fit_cent_neg, b_p_cent),
+          gather_draws(fit_lat_me_neg, b_prec),
+          gather_draws(fit_lat_mi_neg, b_FD_prec)
+          ),
+          .id = "model") |> 
+  ungroup() |> 
+  mutate(model = str_remove_all(model, "gather_draws|\\(|\\)")) |> 
+  mutate(effect = str_extract(model, "(?<=_)[^_,]+(?=,|$)"),
+         model = str_extract(model, "(?<=_).*(?=,)")) |> 
+  mutate(model = str_extract(model, ".*(?=_)")) |> 
+  mutate(model = as_factor(model)) |> 
+  group_by(model, effect, .variable) |> 
+  mean_hdci(.width = c(0.5, 0.95))
+
+summary_p |> 
+  ggplot(aes(y = model, x = .value, xmin = .lower, xmax = .upper)) +
+  geom_pointinterval() +
+  scale_y_discrete(limits = rev(levels(summary_p$model))) +
+  geom_vline(xintercept = -0.5, linetype = 2) +
+  facet_wrap(~ effect, scales = "free_x") +
+  labs(x = "coefficient")
+```
+
+Focusing on the plausible models:
+
+```{r}
+summary2 <- summary_t |> 
+  filter(!model %in% c("conf", "naive")) |> 
+  mutate(model = fct_drop(model)) 
+
+summary2 |> 
+  ggplot(aes(y = model, x = .value, xmin = .lower, xmax = .upper)) +
+  geom_pointinterval() +
+  scale_y_discrete(limits = rev(levels(summary2$model))) +
+  geom_vline(aes(xintercept = x), linetype = 2, data = trueline) +
+  facet_wrap(~ effect, scales = "free_x") +
+  labs(x = "coefficient")
+```
+
+Aside from the missingness model, all other models seem equivalent. The latent mean models, aside from the additional complexity, each show some issues, either in the translation to Stan code or in the excessively large intervals. Since the fixed-effects model is much easier and faster to fit than the others, it is the estimator of choice. Its downside, not being able to estimate site-level effects, is not of interest here (site-level effects are easily confounded). Also, the fixed-effects formulation is simpler with interactions.
+
+# Models with interactions
+
+Additional care must be taken with interaction terms to recover an unconfounded within-site estimator. The interaction of two variables *x* and *z* can be decomposed into four terms [@giesselmann2022, eqq. 7 and 8 without the last term]:
+
+$$x_{w}z_{w} + x_{w}\overline{z}+\overline{x}z_{w}+\overline{xz}$$ 
+
+where *x~w~* represents within-site variations of *x*. Of these terms, only the first represents a true within effect, while the middle two represent cross-level interactions between one variable and average site differences of the other. The last term, whether the interaction is demeaned or not, is constant within a site.
+
+In these models, within-site precipitation fluctuations interact with within-site temperature. In the first scenario, there is no cross-level interactions of within- and between-site temperature differences, or interactions at the site level. Temperature and precipitation are site-centered. This is not necessary in a fixed-effects models, because site means are absorbed in the site term, but it improves model sampling.
+
+## Interaction only within sites
+
+```{r}
+set.seed(820)
+
+sim_int_w <- sim |> 
+  weat_sim(t_y = 1, p_y = -0.5, int_w = -1)
+```
+
+```{r}
+fit_int_std_w <- brm(FD ~ t_cent + p_cent + temp:prec + site,
+                   data = sim_int_w,
+                   prior = prior,
+                   file = "fits/sim/sim.int.std.w",
+                   seed = 295)
+
+fit_int_std_w
+
+mcmc_intervals(fit_int_std_w, pars = show)
+
+conditional_effects(fit_int_std_w, effects = "temp:prec")
+```
+
+```{r}
+fit_int_demean_w <- update(fit_int_std_w,
+                           FD ~ t_cent + p_cent + t_cent:p_cent + site,
+                           file = "fits/sim/sim.int.dem.w",
+                           seed = 295)
+
+fit_int_demean_w
+
+mcmc_intervals(fit_int_demean_w, pars = show)
+
+conditional_effects(fit_int_demean_w, effects = "t_cent:p_cent")
+```
+
+```{r}
+fit_int_dd_w <- update(fit_int_std_w,
+                       FD ~ t_cent + p_cent + t_x_p + site,
+                       newdata = sim_int_w,
+                       file = "fits/sim/sim.int.dd.w",
+                       seed = 295)
+
+fit_int_dd_w
+
+mcmc_intervals(fit_int_dd_w, pars = show)
+```
+
+## With interaction confounding
+
+### Site-level interaction
+
+In the following models, there is an additional interaction between site-level temperature and precipitation.
+
+```{r}
+set.seed(820)
+
+sim_int_w_b <- sim |> 
+  weat_sim(t_y = 1, p_y = -0.5, int_w = -1, int_b = 1)
+```
+
+```{r}
+fit_int_std_w_b <- brm(FD ~ t_cent + p_cent + temp:prec + site,
+                       data = sim_int_w_b,
+                       prior = prior,
+                       file = "fits/sim/sim.int.std.w.b",
+                       seed = 295)
+
+fit_int_std_w_b
+
+mcmc_intervals(fit_int_std_w_b, pars = show)
+
+conditional_effects(fit_int_std_w_b, effects = "temp:prec")
+```
+
+```{r}
+fit_int_demean_w_b <- update(fit_int_std_w_b,
+                             FD ~ t_cent + p_cent + t_cent:p_cent + site,
+                             file = "fits/sim/sim.int.dem.w.b",
+                             seed = 295)
+
+fit_int_demean_w_b
+
+mcmc_intervals(fit_int_demean_w_b, pars = show)
+
+conditional_effects(fit_int_demean_w_b, effects = "t_cent:p_cent")
+```
+
+```{r}
+fit_int_dd_w_b <- update(fit_int_std_w_b,
+                         FD ~ t_cent + p_cent + t_x_p + site,
+                         newdata = sim_int_w_b,
+                         file = "fits/sim/sim.int.dd.w.b",
+                         seed = 295)
+
+fit_int_dd_w_b
+
+mcmc_intervals(fit_int_dd_w_b, pars = show)
+```
+
+### Cross-level interaction
+
+In the following models there is an additional cross-level interaction of within-site temperature changes with site-level precipitation.
+
+```{r}
+set.seed(820)
+
+sim_int_w_c1 <- sim |> 
+  weat_sim(t_y = 1, p_y = -0.5, int_w = -1, int_c1 = 1)
+```
+
+```{r}
+fit_int_std_w_c1 <- brm(FD ~ t_cent + p_cent + temp:prec + site,
+                        data = sim_int_w_c1,
+                        prior = prior,
+                        file = "fits/sim/sim.int.std.w.c1",
+                        seed = 295)
+
+fit_int_std_w_c1
+
+mcmc_intervals(fit_int_std_w_c1, pars = show)
+
+conditional_effects(fit_int_std_w_c1, effects = "temp:prec")
+```
+
+```{r}
+fit_int_demean_w_c1 <- update(fit_int_std_w_c1,
+                              FD ~ t_cent + p_cent + t_cent:p_cent + site,
+                              file = "fits/sim/sim.int.dem.w.c1",
+                              seed = 295)
+
+fit_int_demean_w_c1
+
+mcmc_intervals(fit_int_demean_w_c1, pars = show)
+
+conditional_effects(fit_int_demean_w_c1, effects = "t_cent:p_cent")
+```
+
+```{r}
+fit_int_dd_w_c1 <- update(fit_int_std_w_c1,
+                          FD ~ t_cent + p_cent + t_x_p + site,
+                          newdata = sim_int_w_c1,
+                          file = "fits/sim/sim.int.dd.w.c1",
+                          seed = 295)
+
+fit_int_dd_w_c1
+
+mcmc_intervals(fit_int_dd_w_c1, pars = show)
+```
+
+### Both
+
+The following models have interactions within site, at site level, and cross-level.
+
+```{r}
+set.seed(820)
+
+sim_int_x <- sim |> 
+  weat_sim(t_y = 1, p_y = -0.5, int_w = -1, int_c1 = 1, int_b = 1)
+```
+
+```{r}
+fit_int_std_x <- brm(FD ~ t_cent + p_cent + temp:prec + site,
+                     data = sim_int_x,
+                     prior = prior,
+                     file = "fits/sim/sim.int.std.x",
+                     seed = 295)
+
+fit_int_std_x
+
+mcmc_intervals(fit_int_std_x, pars = show)
+
+conditional_effects(fit_int_std_x, effects = "temp:prec")
+```
+
+```{r}
+fit_int_demean_x <- update(fit_int_std_x,
+                           FD ~ t_cent + p_cent + t_cent:p_cent + site,
+                           file = "fits/sim/sim.int.dem.x",
+                           seed = 295)
+
+fit_int_demean_x
+
+mcmc_intervals(fit_int_demean_x, pars = show)
+
+conditional_effects(fit_int_demean_x, effects = "t_cent:p_cent")
+```
+
+```{r}
+fit_int_dd_x <- update(fit_int_std_x,
+                       FD ~ t_cent + p_cent + t_x_p + site,
+                       newdata = sim_int_x,
+                       file = "fits/sim/sim.int.dd.x",
+                       seed = 295)
+
+fit_int_dd_x
+
+mcmc_intervals(fit_int_dd_x, pars = show)
+```
+
+## Conclusions
+
+From these simulations, it is clear that the uncentered interaction term cannot recover the within-site interaction, unconfounded by time-invariant factors, because it also contains the cross-level interactions. Building the double-demeaned interaction by hand or interacting the centered variables is equivalent, because the site fixed effect absorb the site-level interaction term (the last term), but the latter has the advantage of being able to use standard prediction machinery, because the interaction term is recognized as such.
+
+# Session info
+
+```{r}
+#| echo: false
+sessioninfo::session_info()
+```

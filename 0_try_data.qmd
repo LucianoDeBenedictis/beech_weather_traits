@@ -1,0 +1,448 @@
+---
+title: "TRY data handling"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+#| message: false
+library(tidyverse)
+library(rtry)
+library(DT)
+options(digits = 2)
+options(scipen = 4)
+```
+
+# Import trait data
+
+First, we load the data:
+```{r}
+original <- rtry_import("Data/try_data.txt")
+```
+
+To comply with co-authorship requests, some records are removed. Remaining data have sufficient coverage.
+
+```{r}
+original |> 
+  rtry_select_row(DatasetID %in% c(629, 635, 708, 71, 71, 519)) |>
+  rtry_explore(AccSpeciesName, AccSpeciesID, TraitID, TraitName) |> 
+  filter_out(is.na(TraitID)) |> 
+  datatable()
+
+#anthriscus LA
+original |> 
+  rtry_select_row(AccSpeciesID == 4045 & TraitID == 3117) |> 
+  rtry_explore(AccSpeciesName, AccSpeciesID, TraitID, TraitName, DatasetID)
+
+#chrysosplenium LA
+original |> 
+  rtry_select_row(AccSpeciesID == 12744 & TraitID == 3117) |> 
+  rtry_explore(AccSpeciesName, AccSpeciesID, TraitID, TraitName, DatasetID)
+
+#daphne SSD
+original |> 
+  rtry_select_row(AccSpeciesID == 16958 & TraitID == 4) |> 
+  rtry_explore(AccSpeciesName, AccSpeciesID, TraitID, TraitName, DatasetID)
+
+#doronicum H
+original |> 
+  rtry_select_row(AccSpeciesID == 19149 & TraitID == 3106 & StdValue < 1.5) |> 
+  rtry_explore(AccSpeciesName, AccSpeciesID, TraitID, TraitName, DatasetID)
+
+#hedera H
+original |> 
+  rtry_select_row(AccSpeciesID == 27988 & TraitID == 3106 & StdValue < 1.5) |> 
+  rtry_explore(AccSpeciesName, AccSpeciesID, TraitID, TraitName, DatasetID)
+
+#ilex H
+original |> 
+  rtry_select_row(AccSpeciesID == 30228 & TraitID == 3106 & StdValue < 1.5) |> 
+  rtry_explore(AccSpeciesName, AccSpeciesID, TraitID, TraitName, DatasetID)
+
+#ilex SSD
+original |> 
+  rtry_select_row(AccSpeciesID == 30228 & TraitID == 4) |> 
+  rtry_explore(AccSpeciesName, AccSpeciesID, TraitID, TraitName, DatasetID)
+
+original <- original |> 
+  rtry_select_row(!DatasetID %in% c(629, 635, 708, 71, 71, 519))
+```
+
+We find trait IDs
+
+```{r}
+explore <- rtry_explore(original, DataID, DataName, TraitID, TraitName, sortBy = TraitID)
+
+datatable(explore)
+```
+
+## Check for treatment, status, health, development
+
+We exclude non-natural treatments
+
+```{r}
+status <- rtry_select_row(original, DataID %in% c(327, 413, 1444, 1961)) |> 
+  rtry_explore(DataID, DataName, OriglName, OrigValueStr, OrigUnitStr, StdValue, Comment, sortBy = DataID)
+
+datatable(status)
+
+excluded_treatment <- grepl("chamber|mesocosm|outside|garden|planted|greenhouse",
+      original$OrigValueStr, ignore.case = T)
+
+
+try <- rtry_exclude(original, excluded_treatment, baseOn = ObservationID)
+```
+
+The remaining treatments:
+```{r}
+status <- rtry_select_row(try, DataID %in% c(327, 413, 1444, 1961)) |> 
+  rtry_explore(DataID, DataName, OriglName, OrigValueStr, OrigUnitStr, StdValue, Comment, sortBy = DataID)
+
+datatable(status)
+```
+
+Exclude non-adults:
+
+```{r}
+excluded_status <- grepl("sapling|seedling", try$OrigValueStr, ignore.case = T)
+
+try <- rtry_exclude(try, excluded_status, baseOn = ObservationID)
+```
+
+Remaining statuses:
+
+```{r}
+status <- rtry_select_row(try, DataID %in% c(327, 413, 1444, 1961)) |> 
+  rtry_explore(DataID, DataName, OriglName, OrigValueStr, OrigUnitStr, StdValue, Comment, sortBy = DataID)
+```
+
+Remove ancillary:
+
+```{r}
+try <- rtry_select_row(original, TraitID > 0)
+```
+
+`OrigObsDataID` reveals observation connected to a different ID. Remove only duplicates ID already present in the file:
+
+```{r}
+duplicates <- rtry_explore(try, DataID, DataName, TraitID, OrigObsDataID) |> 
+  pull(OrigObsDataID) |> 
+  na.omit()
+
+IDs <- rtry_explore(try, DataID, DataName, TraitID, ObsDataID) |> 
+  pull(ObsDataID)
+
+duplicates <- duplicates[duplicates %in% IDs]
+
+try <- rtry_exclude(try, OrigObsDataID %in% duplicates, baseOn = ObsDataID)
+```
+
+Check result:
+
+```{r}
+explore <- rtry_explore(try, DataID, DataName, TraitID, TraitName, sortBy = TraitID)
+```
+
+# Keep relevant sub-traits
+
+```{r}
+#exclude trait IDs for generative height and leaflet area
+try <- rtry_exclude(try, TraitID %in% c(3107, 3109, 3111, 3113), baseOn = ObsDataID)
+
+#sub-traits to exclude
+exclude <- c(2386, 2527, 3730, 3731, 20, 1299, 3645, 3646, 3647, 3648, 
+             7216, 7217, 7224, 7225, 7222, 7223)
+
+#check the excluded trait names
+explore |> 
+  filter(DataID %in% exclude) |> 
+  pull(DataName)
+
+#exclude them
+try <- rtry_exclude(try, DataID %in% exclude, baseOn = ObsDataID)
+```
+
+Check result:
+
+```{r}
+explore <- rtry_explore(try, DataID, DataName, TraitID, TraitName, sortBy = TraitID)
+
+#trait names kept
+explore |> 
+  pull(DataName)
+```
+
+# Filter based on error risk 
+
+```{r}
+risky <- try |> 
+  rtry_select_row(ErrorRisk >= 3) |> 
+  rtry_select_col(AccSpeciesName, DataID, DataName, TraitID, TraitName, StdValue, ErrorRisk) |> 
+  arrange(AccSpeciesName, DataName)
+
+#will be useful later if there are missing traits
+risky_traits <- risky |> 
+  distinct(AccSpeciesName, TraitID, TraitName)
+```
+
+## Pteridium aquilinum SM
+
+```{r}
+rtry_select_row(try, (AccSpeciesID == 44805) & (TraitID ==26)) |> 
+  rtry_explore(DataID, DataName, OriglName, OrigValueStr, OrigUnitStr, StdValue, Comment, ErrorRisk, sortBy = OrigValueStr)
+```
+
+1 means "too small to be measured"
+
+## Athyrium filix-femina SM
+
+```{r}
+rtry_select_row(try, (AccSpeciesID == 6006) & (TraitID ==26)) |> 
+  rtry_explore(DataID, DataName, OriglName, OrigValueStr, OrigUnitStr, StdValue, Comment, ErrorRisk, sortBy = OrigValueStr)
+```
+
+1 means "too small to be measured"
+
+Are there NAs?
+
+```{r}
+rtry_select_row(try, is.na(ErrorRisk)) |> 
+  rtry_explore(DataID, DataName, OriglName, OrigValueStr, OrigUnitStr, StdValue, Comment, sortBy = OrigValueStr)
+```
+
+Two will be converted, three have empty values.
+
+Make a copy, in case some species have few measurements and get removed
+
+```{r}
+try_unfiltered <- try
+```
+
+Keep observations with error risk < 3
+
+```{r}
+try <- rtry_exclude(try, ErrorRisk >= 3, baseOn = ObsDataID)
+```
+
+Any species completely removed?
+
+```{r}
+species_filter <- try |> 
+  rtry_explore(AccSpeciesID) |> 
+  pull(AccSpeciesID)
+
+species_unfilter <- try_unfiltered |> 
+  rtry_explore(AccSpeciesID) |> 
+  pull(AccSpeciesID)
+
+species_unfilter[!species_unfilter %in% species_filter]
+```
+
+No, keep going.
+
+# Missing stdvalue
+
+```{r}
+std_missing <- rtry_select_row(try, is.na(StdValue) & !is.na(OrigValueStr))
+
+std_missing
+
+#convert cm to m
+std_missing$StdValue <- parse_number(std_missing$OrigValueStr)/100
+
+std_missing <- std_missing |> 
+  rtry_select_row(StdValue > 0)
+
+#exclude empty rows
+try <- rtry_select_row(try, complete.cases(TraitID) & complete.cases(StdValue)) |> 
+  rtry_bind_row(std_missing) #add the converted values
+```
+
+# Hedera helix and Ilex aquifolium
+
+Most of the height measurements for these species represent fully grown individuals, but we have understory records which are for sure below 1.5 m. Check for suitable data or otherwise exclude those values.
+
+## Hedera helix height
+
+All heights < 1.5 in original data
+
+```{r}
+hedera_h <- rtry_select_row(original, AccSpeciesID == 27988 & TraitID == 3106 & StdValue < 1.5)
+
+#check the ancillary for those observations
+hedera_anc <- rtry_select_row(original, ObservationID %in% hedera_h$`ObservationID`,
+                              getAncillary = T) |> 
+  filter(TraitID %in% c(3106, NA)) |> 
+  arrange(ObservationID) |> 
+  select(!c(1:6, 18:20, 24, 25, 29))
+
+#keep useful ancillaries
+hedera_anc <- rtry_select_row(hedera_anc, TraitID > 0 | DataID %in% c(193, 235, 413, 1863))
+
+#reference list for hedera height
+hedera_ref <- hedera_anc |> 
+  distinct(Reference)
+
+#calculate mean height
+hedera_h <- mean(hedera_h$StdValue)
+```
+
+## Ilex aquifolium height
+
+```{r}
+ilex_h <- rtry_select_row(original, AccSpeciesID == 30228 & TraitID == 3106 & StdValue < 1.5)
+
+#check the ancillary for those observations
+ilex_anc <- rtry_select_row(original, ObservationID %in% ilex_h$`ObservationID`,
+                              getAncillary = T) |> 
+  filter(TraitID %in% c(3106, NA)) |> 
+  arrange(ObservationID) |> 
+  select(!c(1:6, 18:20, 24, 25, 29))
+
+#keep useful ancillaries
+ilex_anc <- rtry_select_row(ilex_anc, TraitID > 0 | DataID %in% c(193, 235, 413, 1863))
+
+#reference list for ilex height
+ilex_ref <- ilex_anc |> 
+  distinct(Reference)
+
+#calculate mean height
+ilex_h <- mean(ilex_h$StdValue)
+```
+
+# Summary
+
+```{r}
+#keep relevant columns
+traits <- rtry_select_col(try, ObservationID, ObsDataID, AccSpeciesName, TraitID, 
+                              TraitName, StdValue, UnitName) 
+
+#put together traits
+traitlist <- rtry_explore(traits, TraitID, TraitName, sortBy = TraitName)
+
+traitlist$trait <- c(rep("LA", 4), rep("SLA", 3), "LN", "PH", "SM", "SSD")
+
+traitlist <- traitlist[, c(2, 4)]
+
+#join coarse trait names
+
+traits <- traits |> 
+  left_join(traitlist) |> 
+  select(!c(TraitName, TraitID))
+
+risky_traits <- risky_traits |> 
+  left_join(traitlist) |> 
+  select(!c(TraitName, TraitID))
+
+#list of references for main table
+refs <- rtry_select_col(try, Reference) |> 
+  distinct()
+```
+
+Check if "risky" data have otherwise missing traits:
+
+```{r}
+risky_missing <- anti_join(risky_traits, traits)
+
+risky_missing
+```
+
+Handle missing traits:
+
+```{r}
+risky_missing <- risky_missing |> 
+  left_join(traitlist, relationship = "many-to-many", multiple = "all")
+
+risky <- semi_join(risky, risky_missing) |> 
+  arrange(AccSpeciesName, TraitName) |> 
+  select(AccSpeciesName, TraitName, StdValue) |> 
+  left_join(traitlist)
+```
+
+Remove "too small to be measured" SM indicator:
+
+```{r}
+risky <- risky |> 
+  filter(!(trait == "SM" & StdValue == 1))
+
+#references for risky missing
+
+risky_refs <- try_unfiltered |> 
+  semi_join(risky) |> 
+  distinct(Reference)
+
+risky <- risky |>
+  select(!TraitName) |> 
+  group_by(AccSpeciesName, trait) |> 
+  summarise(StdValue = mean(StdValue))
+```
+
+Add units:
+
+```{r}
+risky <- traits |> 
+  distinct(trait, UnitName) |> 
+  right_join(risky)
+```
+
+Join risky but otherwise missing traits. Those species are not necessary for the analyses anyway (ferns and saphrophytes):
+
+```{r}
+traits <- traits |> 
+  bind_rows(risky)
+```
+
+Pivot:
+
+```{r}
+traits <- traits |> 
+  pivot_wider(id_cols = c(ObservationID, AccSpeciesName),
+              names_from = c(trait, UnitName),
+              values_from = StdValue, values_fn = mean)
+```
+
+Species means:
+
+```{r}
+traits <- traits |> 
+  select(!ObservationID) |> 
+  group_by(AccSpeciesName) |> 
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm =T))) |> 
+  select(1, 5, 3, 6, 4, 7, 2) #reorder columns
+```
+
+Add hedera and ilex:
+
+```{r}
+traits[which(traits$AccSpeciesName == "Hedera helix"), "PH_m"] <- hedera_h
+
+traits[which(traits$AccSpeciesName == "Ilex aquifolium"), "PH_m"] <- ilex_h
+```
+
+```{r}
+traits |> 
+  mutate(across(where(is.numeric), \(x) round(x, 3))) |> 
+  datatable()
+```
+
+# List of References
+
+```{r}
+bind_rows(refs, risky_refs, hedera_ref, ilex_ref) |> 
+  distinct() |> 
+  arrange(Reference) |> 
+  datatable()
+```
+
+# Export
+
+```{r}
+write_csv(traits, "Data/try_traits.csv")
+```
+
+# Session info
+
+```{r}
+#| echo: false
+sessioninfo::session_info()
+```

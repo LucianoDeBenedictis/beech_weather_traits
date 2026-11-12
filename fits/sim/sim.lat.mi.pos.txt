@@ -1,0 +1,142 @@
+// generated with brms 2.23.0
+functions {
+}
+data {
+  int<lower=1> N;  // total number of observations
+  int<lower=1> N_FD;  // number of observations
+  vector[N_FD] Y_FD;  // response variable
+  int<lower=1> K_FD;  // number of population-level effects
+  matrix[N_FD, K_FD] X_FD;  // population-level design matrix
+  int<lower=1> Kc_FD;  // number of population-level effects after centering
+  int<lower=1> Ksp_FD;  // number of special effects terms
+  int<lower=1> N_temp2;  // number of observations
+  vector[N_temp2] Y_temp2;  // response variable
+  // data for measurement-error in the response
+  vector<lower=0>[N_temp2] noise_temp2;
+  // information about non-missings
+  int<lower=0> Nme_temp2;
+  array[Nme_temp2] int<lower=1> Jme_temp2;
+  int<lower=1> N_prec2;  // number of observations
+  vector[N_prec2] Y_prec2;  // response variable
+  // data for measurement-error in the response
+  vector<lower=0>[N_prec2] noise_prec2;
+  // information about non-missings
+  int<lower=0> Nme_prec2;
+  array[Nme_prec2] int<lower=1> Jme_prec2;
+  // data for group-level effects of ID 1
+  int<lower=1> N_1;  // number of grouping levels
+  int<lower=1> M_1;  // number of coefficients per level
+  array[N_FD] int<lower=1> J_1_FD;  // grouping indicator per observation
+  // group-level predictor values
+  vector[N_FD] Z_1_FD_1;
+  // data for group-level effects of ID 2
+  int<lower=1> N_2;  // number of grouping levels
+  int<lower=1> M_2;  // number of coefficients per level
+  array[N_temp2] int<lower=1> J_2_temp2;  // grouping indicator per observation
+  // group-level predictor values
+  vector[N_temp2] Z_2_temp2_1;
+  // data for group-level effects of ID 3
+  int<lower=1> N_3;  // number of grouping levels
+  int<lower=1> M_3;  // number of coefficients per level
+  array[N_prec2] int<lower=1> J_3_prec2;  // grouping indicator per observation
+  // group-level predictor values
+  vector[N_prec2] Z_3_prec2_1;
+  int prior_only;  // should the likelihood be ignored?
+}
+transformed data {
+  matrix[N_FD, Kc_FD] Xc_FD;  // centered version of X_FD without an intercept
+  vector[Kc_FD] means_X_FD;  // column means of X_FD before centering
+  for (i in 2:K_FD) {
+    means_X_FD[i - 1] = mean(X_FD[, i]);
+    Xc_FD[, i - 1] = X_FD[, i] - means_X_FD[i - 1];
+  }
+}
+parameters {
+  vector[Kc_FD] b_FD;  // regression coefficients
+  real Intercept_FD;  // temporary intercept for centered predictors
+  vector[Ksp_FD] bsp_FD;  // special effects coefficients
+  real<lower=0> sigma_FD;  // dispersion parameter
+  vector[N_temp2] Yl_temp2;  // latent variable
+  real Intercept_temp2;  // temporary intercept for centered predictors
+  real<lower=0> sigma_temp2;  // dispersion parameter
+  vector[N_prec2] Yl_prec2;  // latent variable
+  real Intercept_prec2;  // temporary intercept for centered predictors
+  real<lower=0> sigma_prec2;  // dispersion parameter
+  vector<lower=0>[M_1] sd_1;  // group-level standard deviations
+  array[M_1] vector[N_1] z_1;  // standardized group-level effects
+  vector<lower=0>[M_2] sd_2;  // group-level standard deviations
+  array[M_2] vector[N_2] z_2;  // standardized group-level effects
+  vector<lower=0>[M_3] sd_3;  // group-level standard deviations
+  array[M_3] vector[N_3] z_3;  // standardized group-level effects
+}
+transformed parameters {
+  vector[N_1] r_1_FD_1;  // actual group-level effects
+  vector[N_2] r_2_temp2_1;  // actual group-level effects
+  vector[N_3] r_3_prec2_1;  // actual group-level effects
+  // prior contributions to the log posterior
+  real lprior = 0;
+  r_1_FD_1 = (sd_1[1] * (z_1[1]));
+  r_2_temp2_1 = (sd_2[1] * (z_2[1]));
+  r_3_prec2_1 = (sd_3[1] * (z_3[1]));
+  lprior += normal_lpdf(b_FD | 0, 1);
+  lprior += student_t_lpdf(Intercept_FD | 3, 0, 0.7);
+  lprior += normal_lpdf(bsp_FD | 0, 1);
+  lprior += student_t_lpdf(sigma_FD | 3, 0, 0.5)
+    - 1 * student_t_lccdf(0 | 3, 0, 0.5);
+  lprior += student_t_lpdf(Intercept_temp2 | 3, -0.6, 2.5);
+  lprior += student_t_lpdf(sigma_temp2 | 3, 0, 0.5)
+    - 1 * student_t_lccdf(0 | 3, 0, 0.5);
+  lprior += student_t_lpdf(Intercept_prec2 | 3, -0.2, 2.5);
+  lprior += student_t_lpdf(sigma_prec2 | 3, 0, 0.5)
+    - 1 * student_t_lccdf(0 | 3, 0, 0.5);
+  lprior += student_t_lpdf(sd_1 | 3, 0, 0.5)
+    - 1 * student_t_lccdf(0 | 3, 0, 0.5);
+  lprior += student_t_lpdf(sd_2 | 3, 0, 1)
+    - 1 * student_t_lccdf(0 | 3, 0, 1);
+  lprior += student_t_lpdf(sd_3 | 3, 0, 1)
+    - 1 * student_t_lccdf(0 | 3, 0, 1);
+}
+model {
+  // likelihood including constants
+  if (!prior_only) {
+    // initialize linear predictor term
+    vector[N_FD] mu_FD = rep_vector(0.0, N_FD);
+    // initialize linear predictor term
+    vector[N_temp2] mu_temp2 = rep_vector(0.0, N_temp2);
+    // initialize linear predictor term
+    vector[N_prec2] mu_prec2 = rep_vector(0.0, N_prec2);
+    mu_FD += Intercept_FD;
+    mu_temp2 += Intercept_temp2;
+    mu_prec2 += Intercept_prec2;
+    for (n in 1:N_FD) {
+      // add more terms to the linear predictor
+      mu_FD[n] += (bsp_FD[1]) * Yl_temp2[n] + (bsp_FD[2]) * Yl_prec2[n] + r_1_FD_1[J_1_FD[n]] * Z_1_FD_1[n];
+    }
+    for (n in 1:N_temp2) {
+      // add more terms to the linear predictor
+      mu_temp2[n] += r_2_temp2_1[J_2_temp2[n]] * Z_2_temp2_1[n];
+    }
+    for (n in 1:N_prec2) {
+      // add more terms to the linear predictor
+      mu_prec2[n] += r_3_prec2_1[J_3_prec2[n]] * Z_3_prec2_1[n];
+    }
+    target += normal_id_glm_lpdf(Y_FD | Xc_FD, mu_FD, b_FD, sigma_FD);
+    target += normal_lpdf(Yl_temp2 | mu_temp2, sigma_temp2);
+    target += normal_lpdf(Yl_prec2 | mu_prec2, sigma_prec2);
+  }
+  // priors including constants
+  target += lprior;
+  target += normal_lpdf(Y_temp2[Jme_temp2] | Yl_temp2[Jme_temp2], noise_temp2[Jme_temp2]);
+  target += normal_lpdf(Y_prec2[Jme_prec2] | Yl_prec2[Jme_prec2], noise_prec2[Jme_prec2]);
+  target += std_normal_lpdf(z_1[1]);
+  target += std_normal_lpdf(z_2[1]);
+  target += std_normal_lpdf(z_3[1]);
+}
+generated quantities {
+  // actual population-level intercept
+  real b_FD_Intercept = Intercept_FD - dot_product(means_X_FD, b_FD);
+  // actual population-level intercept
+  real b_temp2_Intercept = Intercept_temp2;
+  // actual population-level intercept
+  real b_prec2_Intercept = Intercept_prec2;
+}

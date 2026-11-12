@@ -1,0 +1,427 @@
+---
+title: "Cover-weighted traits data setup"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+```{r}
+#| message: false
+#| warning: false
+library(conflicted)
+library(readxl)
+library(mice)
+library(ggmice)
+library(tidyverse)
+library(patchwork)
+library(DT)
+
+conflicts_prefer(dplyr::filter,
+                 stats::lag)
+
+options(digits = 3)
+
+set.seed(2058)
+
+theme_set(theme_minimal())
+
+weat <- readRDS("intermediate/weat.rds")
+dates <- readRDS("intermediate/dates.rds")
+
+show <- vars(!c(lprior, lp__, b_Intercept))
+```
+
+## Matrix product backend
+
+Despite setting a seed, imputations with `mice()` from different machines or operating systems might differ slightly, while imputations from the same machine and OS should be fully reproducible. I narrowed this down to different matrix product implementations. To circumvent this problem, the following line sets NETLIB as default matrix backend (default on Windows) if available. Alternatively, use the provided `cwm_itp.rds` file in notebooks following this one.
+
+```{r}
+if (.Platform$OS.type == "unix"){
+  library(flexiblas)
+  if(flexiblas_avail() && "NETLIB" %in% flexiblas_list()){
+    flexiblas_switch(flexiblas_load_backend("NETLIB"))
+  }
+  flexiblas_current_backend()
+}
+```
+
+## Import trait data
+
+```{r}
+traits <- read_xlsx("Data/traits.xlsx", sheet = 1) |> 
+  select(species:persistence, la:sm, Fern_Sapro) |>
+  #remove height if higher than recorded
+  mutate(ph = if_else(ph < 1.5, ph, NA))
+
+datatable(traits)
+```
+
+## Import vegetation data
+
+```{r}
+#| message: false
+data <- read_csv("Data/abundances.csv", trim_ws = T) |>
+  #remove bryophythes
+  filter(!species %in% c("Atrichum_undulatum", "Hypnum_cupressiforme", 
+  "Plagiomnium_affine", "Polytrichum_formosum", "Rhizomnium_punctatum")) |> 
+  #use more correct names for the plots
+  mutate(plot = recode_values(plot,
+                              "ABR01" ~ "01-ABR1",
+                              "CAL03" ~ "03-CAL1",
+                              "CAM04" ~ "04-CAM1",
+                              "VEN20" ~ "20-VEN1",
+                              default = plot)) |> 
+  #sum covers inside subplots
+  group_by(date, plot, species) |> 
+  summarise(cover = sum(cover)) |> 
+  #convert to proportions
+  mutate(cover = cover/sum(cover)) |> 
+  ungroup()
+```
+
+## Filter plots with missing trait data
+
+Ferns and saprophytes are excluded for some traits: ferns for diaspore mass, saprophytes for height and leaf traits.
+
+```{r}
+# leaf traits and height (competition for light) to exclude saprophytes
+leaf_height <- c("la", "ln", "sla", "ph")
+
+#tibble to store vegetation, weather data, and models for each trait
+cwm <- tibble(trait = traits |> 
+                select(!c(species, Fern_Sapro)) |>
+                colnames())
+
+#total number of plot-years, same for all traits
+plotn <- data |> 
+  summarise(n_distinct(date, plot)) |> 
+  pull()
+
+#function to filter data for each trait based on cover
+traitfilter <- function(trait){
+  subtrait <- traits |> 
+    select(species, Fern_Sapro, trait = {{trait}}) |>
+    drop_na(trait)
+  
+  subtrait <- if(trait == "sm"){
+    #exclude ferns for seed mass
+    subtrait |> 
+      filter_out(Fern_Sapro == "F")
+  } else if(trait %in% leaf_height){
+    #exclude saprophytes for leaf and height traits
+    subtrait |> 
+      filter_out(Fern_Sapro == "Sapro")
+  } else subtrait
+  
+  data |> 
+    filter(species %in% subtrait$species) |> 
+    group_by(date, plot) |> 
+    mutate(tot_cover = sum(cover)) |>
+    filter(tot_cover > 0.8) |>
+    select(!tot_cover) |> 
+    #restore sums to 1
+    mutate(cover = cover / sum(cover)) |> 
+    ungroup()
+}
+
+cwm <- cwm |> 
+  mutate(d = map(trait, traitfilter),
+         n_left = map_int(d, \(x) x |> 
+                        summarise(n_distinct(date, plot)) |>
+                        pull()),
+         n_removed = plotn - n_left)
+
+datatable(cwm)
+```
+
+Which site-years have been removed?
+
+```{r}
+cwm |> 
+  mutate(removed = map(d,
+                       \(x) anti_join(data |>
+                                        distinct(date, plot),
+                                      x))) |> 
+  select(trait, removed) |> 
+  unnest(removed) |> 
+  datatable()
+```
+
+## Empirical CWM
+
+```{r}
+#calculate empirical CWM as outcome for imputation
+calc_cwm <- function(x, trait){
+  traits |> 
+    select(species, all_of(trait)) |> 
+    right_join(x) |> 
+    summarise(cwm = weighted.mean(.data[[trait]], cover, na.rm = T),
+              .by = c(date, plot)) |> 
+    rename(survey_year = date, site = plot)
+}
+
+cwm <- cwm |> 
+  mutate(imp = map2(d, trait, calc_cwm))
+```
+
+Plot yearly trends in CWM:
+
+```{r}
+cwm |> 
+  select(trait, imp) |> 
+  unnest(imp) |> 
+  ggplot(aes(x = survey_year, y = cwm, colour = site)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(vars(trait), scales = "free_y")
+```
+
+The large increase in leaf area in 01-ABR1 seems driven by *Rubus caesius*
+
+```{r}
+cwm |> 
+  filter(trait == "la") |> 
+  pluck("d", 1) |> 
+  filter(plot == "01-ABR1") |> 
+  arrange(desc(cover)) |> 
+  left_join(traits |>  select(species, la)) |> 
+  datatable()
+```
+
+The consistently higher seed mass and SSD in 03-CAL1 seems to be because of *Ruscus aculeatus*
+
+```{r}
+cwm |> 
+  filter(trait == "sm") |> 
+  pluck("d", 1) |> 
+  filter(plot == "03-CAL1") |> 
+  arrange(desc(cover)) |> 
+  left_join(traits |>  select(species, sm)) |> 
+  datatable()
+
+cwm |> 
+  filter(trait == "ssd") |> 
+  pluck("d", 1) |> 
+  filter(plot == "03-CAL1") |> 
+  arrange(desc(cover)) |> 
+  left_join(traits |>  select(species, ssd)) |> 
+  datatable()
+```
+
+# Imputation
+
+Imputation needs to be done for each trait outcome to be congenial. The considerations about the imputation models and variables are the same as in the "weather" notebook.
+
+```{r}
+#remove min and max columns
+weat <- weat |> 
+  select(!contains(c("min", "max"))) |> 
+#remove empty columns
+  select(!c(solar_radiation_mean_ITP, wind_speed_mean_ITP)) |> 
+#remove wind speed
+  select(!wind_speed_mean_OFD)
+
+# identify variable blocks
+temp_vars <- colnames(weat)[4:8]
+
+hum_vars <- colnames(weat)[9:12]
+
+#join dates
+weat <- weat |> 
+  full_join(dates, relationship = "one-to-one")
+```
+
+```{r}
+#add weather to data
+cwm <- cwm |> 
+  mutate(imp = map(imp, \(x) weat |> 
+                     left_join(x)))
+
+#remove surveys without any weather
+cwm <- cwm |> 
+  mutate(exclude = map(imp, \(x) x |> 
+                     drop_na(survey_year) |>
+                     group_by(site, survey_year) |> 
+                     summarise(across(air_t_mean_OFD:precipitation_ITP,
+                                      \(x) sum(is.na(x))), .groups = "drop") |> 
+                     filter(if_all(air_t_mean_OFD:precipitation_ITP, \(x) x == 12)) |> 
+                     select(site, survey_year)))
+
+cwm <- cwm |> 
+  mutate(imp = map2(imp, exclude, \(x, y) x |> 
+                      anti_join(y) |> 
+                      mutate(across(c(site, survey_year, year, month), as_factor)))) |> 
+  select(!exclude)
+```
+
+Setting up `mice`:
+
+```{r}
+method <- cwm |> 
+  pluck("imp", 1) |> 
+  make.method()
+
+method["survey_year"] <- ""
+
+predmat <- cwm |> 
+  pluck("imp", 1) |> 
+  quickpred(include = c("cwm", "month"), exclude = "survey_year")
+
+#exclude outcomes which are not imputed for clarity
+predmat[which(method == ""),] <- 0
+
+plot_pred(predmat, rotate = T)
+```
+
+Imputation:
+
+```{r}
+cwm <- cwm |> 
+  mutate(mice = map(imp, \(x) x |> 
+                      mice(predictorMatrix = predmat,
+                           method = method,
+                           m = 5, maxit = 100,
+                           printFlag = F,
+                           seed = 19223)))
+
+#complete and keep only data corresponding to surveys
+
+cwm <- cwm |> 
+  mutate(complete = map(mice, \(x) x |> 
+                          complete(action = "long") |> 
+                          semi_join(dates |> 
+                                      mutate(across(everything(), as_factor)))))
+```
+
+## Imputation diagnostics
+
+Check for NAs, convergence, differences between imputations, imputed against observed data. Since there is heterogeneity in months, the latter is done by month.
+
+```{r}
+#plotting functions
+#box plot
+bwplot_imp <- function(data, vars) {
+  map(vars, 
+      ~ {
+        ggmice(data, aes(x = .imp, y = .data[[.x]])) +
+          geom_boxplot() +
+          labs(x = "Imputation number")
+      }
+  ) |> 
+    patchwork::wrap_plots()&
+    theme(legend.position = "none")
+}
+
+#density plot
+densplot_imp <- function(data, vars) {
+  map(vars, 
+      ~ {
+        ggmice(data, aes(x = .data[[.x]], group = .imp, size = .where)) +
+          geom_density()+
+          scale_size_manual(
+            values = c("observed" = 1, "imputed" = 0.5),
+            guide = "none")+
+          facet_wrap(~month,
+                     ncol = 3,
+                     strip.position = "right",
+                     scales = "free_y")+
+          theme(strip.text = element_text(size = 8))+
+          ggtitle("month")
+      }
+  ) |> 
+    patchwork::wrap_plots(guides = "collect", ncol = 1)&
+    theme(legend.position = "bottom")
+}
+
+#convergence plot
+convplot_imp <- function(data, vars, dia = psrf){
+  convergence(data) |> 
+    filter_out(is.na({{dia}})) |> 
+    ggplot(aes(x = .it, y = {{dia}})) +
+    geom_line() +
+    geom_hline(yintercept = 1, linetype = 2, alpha = 0.5) +
+    facet_wrap(~vrb)
+}
+
+# imputed variables 
+to_plot <- c("air_t_mean_ITP", "soil_t_mean_ITP", "relative_humidity_mean_ITP", "precipitation_ITP")
+
+cwm |>
+  mutate(nas = map(complete, \(t) t |> 
+                     summarise(across(everything(), \(x) sum(is.na(x))))), .keep = "none") |> 
+  unnest_wider(nas) |> 
+  filter(if_any(everything(), \(x) x > 0))
+```
+
+```{r}
+#| results: 'hide' 
+map2(cwm$mice, cwm$trait, \(x, y) plot_trace(x, vrb = !!to_plot) +
+              theme(strip.text.y.left = element_text(size = 8, angle = 0)) +
+              labs(title = y))
+
+map2(cwm$mice, cwm$trait, \(x, y) convplot_imp(x) +
+        labs(title = y))
+
+map2(cwm$mice, cwm$trait, \(x, y) bwplot_imp(x, to_plot) &
+       plot_annotation(title = y))
+```
+
+
+```{r}
+#| fig-asp: 3
+map2(cwm$mice, cwm$trait, \(x, y) densplot_imp(x, to_plot) &
+       plot_annotation(title = y))
+```
+
+## Preparing data for models
+
+```{r}
+#convert mids to list of dataframes, clean columns, calculate annual means
+finish_weat <- function(x, veg){
+  x |> 
+  semi_join(dates |> 
+                select(site, survey_year) |> 
+                mutate(across(everything(), as_factor))) |> 
+    select(!c("month", "year", "cwm")) |>
+    #remove OFD used for imputation
+    select(!ends_with("OFD")) |> 
+    rename_with(\(x) str_remove(x, "_ITP")) |> 
+    #calculate 12-month means for each survey
+    group_by(site, survey_year) |> 
+    summarise(across(everything(), mean), .groups = "drop") |> 
+    #precipitation multiplied by 12 because it's an extensive property
+    mutate(across(contains("precipitation"), \(x) x * 12)) |> 
+    rename(year = survey_year) |> 
+    #CAM has no observed ITP data, those should probably not be used in models
+    filter_out(site == "04-CAM1") |> 
+    #join vegetation data
+    inner_join(veg |> 
+                 mutate(across(date:species, as_factor)) |> 
+                 rename(year = date, site = plot, cov_wt = cover),
+               relationship = "one-to-many")
+  }
+
+cwm_ITP <- cwm |> 
+  mutate(complete = map2(mice, d, \(x, y) complete(x, action = "all") |> 
+                         map(\(t) finish_weat(t, y)))) |> 
+  select(trait, data = complete)
+
+#join trait values
+cwm_ITP <- cwm_ITP |> 
+  mutate(data = map2(trait, data,
+                     \(x, y) y |> 
+                       map(\(t) traits |> 
+                       select(species, all_of(x)) |> 
+                       right_join(t, by = "species"))))
+
+
+saveRDS(cwm_ITP, "intermediate/cwm_itp.rds")
+```
+
+# Session info
+
+```{r}
+#| echo: false
+sessioninfo::session_info()
+```

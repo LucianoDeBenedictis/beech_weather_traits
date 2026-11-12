@@ -1,0 +1,220 @@
+---
+title: "Graphical model of the causal relationships"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+#| echo: false
+
+#install.packages('datawizard')
+#install.packages('shape')
+
+library(dagitty)
+library(tidyverse)
+
+source("functions.R")
+```
+
+# DAG
+
+This network (DAG, directed acyclic graph) shows the assumptions underlying the statistical models and allows deriving adjustment sets for each estimand.
+
+Weather effects on the understory functional diversity are mediated by sub-canopy weather, which is affected by stand features such as canopy cover and forest structure. Two variables represent selection that doesn't affect the causal estimate: all sites share similar climate by being beech forests, and all stands have ages higher than 120 years, reducing the range of canopy cover and structural features. Confounding is mainly thought to arise through geographic location, which affects both the open-field weather and the species occurring in the sites. The probability of missingness in weather data is affected by the geographic position (meaning that some sites, especially 04-CAM1 have more missing data), making this m-DAG consistent with the canonical form A in [@moreno-betancur2018], which means the regression estimate of interest is recoverable with either complete-case analysis or multiple imputation.
+
+Unmeasured confounds related to the geographic position of different sites can affect weather, obviously, and functional diversity: geographic position can affect the local functional diversity through the regional species pool, either directly because some pools have more functionally diverse species, or through species richness. This is accounted for by the use of SES. Additionally, geographic position can affect functional diversity through, for example, soil type. Since these confounding effects are assumed to be time-invariant, at least within the observed time scale, the use of group mean centering allows for valid causal inference. Note that this is valid for any time-invariant confound of weather and traits, whether it is mediated by geographic position or not.
+
+In all cases, we are also adjusting for richness and regional pool differences by using the SES of FD based on the local species pool, instead of the raw value of Q.
+
+Showing which weather variables affect which traits, we assume that the effect of air temperature on belowground traits is fully mediated by soil temperature. We are also assuming that canopy cover influences both aboveground and belowground traits: this is a weaker assumption than the opposite, and can be faced with data.
+
+```{r}
+#| fig-width: 10
+#| fig-height: 6.2
+#| fig-dpi: 600
+
+dag <- dagitty("dag {
+\"Aboveground traits\" [pos=\"1.7,-1\"]
+\"Age >100\" [pos=\"0,-2\"]
+\"Beech forest\" [pos=\"-1.3,0\"]
+\"Belowground traits\" [pos=\"1.7,1\"]
+\"Canopy cover\" [pos=\"0.85,-1.5\"]
+\"Forest structure\" [pos=\"0,-1.5\"]
+\"Geographic position\" [pos=\"-0.1,1.8\"]
+\"Open-field precipitation\" [pos=\"-1.3,1\"]
+\"Open-field soil temperature\" [pos=\"-0.5,-0.5\"]
+\"Open-field air temperature\" [pos=\"-1.3,-1\"]
+\"Overall FD\" [pos=\"2.3,0\"]
+\"Regional pool\" [pos=\"0.5,1.5\"]
+\"Soil features\" [pos=\"1.7,0\"]
+\"Sub-canopy soil temperature\" [pos=\"0,0\"]
+\"Sub-canopy air temperature\" [pos=\"0,-1\"]
+\"Sub-canopy precipitation\" [pos=\"0.5,1\"]
+M_OF [pos=\"-1.7,1.3\"]
+M_SC [pos=\"-1.7,1.8\"]
+Richness [pos=\"1.5,1.5\"]
+U_1 [latent,pos=\"-1.8,0\"]
+U_2 [latent,pos=\"2.4,1.8\"]
+\"Aboveground traits\" -> \"Overall FD\"
+\"Age >100\" -> \"Forest structure\"
+\"Forest structure\" -> \"Canopy cover\"
+\"Beech forest\" -> \"Open-field precipitation\"
+\"Beech forest\" -> \"Open-field air temperature\"
+\"Belowground traits\" -> \"Overall FD\"
+\"Canopy cover\" -> \"Aboveground traits\"
+\"Canopy cover\" -> \"Belowground traits\"
+\"Canopy cover\" -> \"Sub-canopy air temperature\"
+\"Canopy cover\" -> \"Sub-canopy soil temperature\"
+\"Canopy cover\" -> \"Sub-canopy precipitation\"
+\"Forest structure\" -> \"Sub-canopy air temperature\"
+\"Geographic position\" -> \"Open-field precipitation\"
+\"Geographic position\" -> \"Open-field air temperature\"
+\"Geographic position\" -> \"Regional pool\"
+\"Geographic position\" -> M_OF
+\"Geographic position\" -> M_SC
+\"Geographic position\" -> U_2
+\"Open-field precipitation\" -> \"Sub-canopy precipitation\"
+\"Open-field air temperature\" -> \"Open-field soil temperature\"
+\"Open-field air temperature\" -> \"Sub-canopy air temperature\"
+\"Regional pool\" -> \"Belowground traits\"
+\"Regional pool\" -> Richness
+\"Soil features\" -> \"Aboveground traits\"
+\"Soil features\" -> \"Belowground traits\"
+\"Sub-canopy soil temperature\" -> \"Aboveground traits\"
+\"Sub-canopy soil temperature\" -> \"Belowground traits\"
+\"Sub-canopy soil temperature\" -> \"Soil features\"
+\"Sub-canopy air temperature\" -> \"Aboveground traits\"
+\"Sub-canopy air temperature\" -> \"Sub-canopy soil temperature\"
+\"Sub-canopy precipitation\" -> \"Aboveground traits\"
+\"Sub-canopy precipitation\" -> \"Belowground traits\"
+\"Sub-canopy precipitation\" -> \"Soil features\"
+Richness -> \"Belowground traits\"
+U_1 -> \"Open-field precipitation\"
+U_1 -> \"Open-field air temperature\"
+U_2 -> \"Aboveground traits\"
+U_2 -> \"Belowground traits\"
+}")
+
+cols <- rep("black", length(names(dag))) |> 
+  setNames(names(dag))
+
+cols[c("Geographic position", "U_2", "Regional pool")] <- "dodgerblue3"
+
+cols[c("Beech forest", "Age >100")] <- "darkgoldenrod"
+
+cols[c("M_OF", "M_SC")] <- "firebrick"
+
+est <- c("Aboveground traits", "Belowground traits", "Open-field air temperature",
+         "Open-field precipitation", "Sub-canopy air temperature", "Sub-canopy precipitation",
+         "Sub-canopy soil temperature", "Overall FD")
+
+edg <- edges(dag)[, 1:2] |> 
+  mutate(col = if_else((v %in% est) & (w %in% est),
+                       "firebrick", "black")) |>
+  pull(col)
+  
+mydag(dag, col_labels = cols, col_arrow = edg,
+      lwd = 1.5, cex = 0.9, arr.length = 0.15, arr.width = 0.1, radius = 4)
+```
+
+In the DAG above, time invariant confounds are highlighted in blue, selection variables in yellow and missingness indicators in red.
+
+```{r}
+#| include: false
+
+png('output/DAG.png', bg = "white", width = 10, height = 6.2, units = "in",
+    pointsize = 12, res = 600)
+mydag(dag, col_labels = cols, col_arrow = edg,
+      lwd = 1.5, cex = 0.9, arr.length = 0.15, arr.width = 0.1, radius = 4)
+dev.off()
+```
+
+## Minimal adjustment sets for open-field weather
+
+```{r}
+outcomes(dag) <- "Overall FD"
+exposures(dag) <- c("Open-field air temperature", "Open-field precipitation")
+
+adjustmentSets(dag, effect = "total")
+```
+
+This shows that it's sufficient to condition on geographic position and either precipitation for temperature, or temperature for precipitation.
+If U were known, it would be possible to condition on both the regional species pool and U, but in this case it is necessary to condition on geographic position. This is one approach, but it is also possible to condition on its descendants: as long as the unmeasured confounds are time-invariant, the longitudinal data allows to account for them through the chosen within-site estimation.
+In this case, we choose to adjust on geographic position (time-invariant, through the estimator), and the other weather variable. This has the advantage that the same model can be used for both and their interaction, since it contains the necessary adjustment sets for both.
+
+The situation is the same for the two subsets of traits:
+
+```{r}
+outcomes(dag) <- "Aboveground traits"
+
+adjustmentSets(dag, effect = "total")
+
+outcomes(dag) <- "Belowground traits"
+
+adjustmentSets(dag, effect = "total")
+```
+
+## Minimal adjustment sets for sub-canopy weather
+
+Changing the exposure from open-field weather to sub-canopy weather provide the same options, but also to condition on open-field weather, as long as it fully mediates the effect of geographic position on sub-canopy weather. Instead of requiring this assumption, we use the same approach as above. 
+Additionally, and differently from the effect of open-field weather on FD, canopy cover should be adjusted for to estimate the total effect of sub-canopy weather on FD. In the latter it is not necessary, because with the DAG as drawn, sub-canopy air temperature is a collider of open-field weather and canopy cover.
+
+```{r}
+outcomes(dag) <- "Overall FD"
+exposures(dag) <- c("Sub-canopy air temperature", "Sub-canopy precipitation")
+
+adjustmentSets(dag, effect = "total")
+```
+
+Thus we choose to adjust on geographic position (time-invariant), canopy cover, and the other weather variable.
+The conclusions are the same for subsets of traits.
+
+```{r}
+outcomes(dag) <- "Aboveground traits"
+adjustmentSets(dag, effect = "total")
+
+outcomes(dag) <- "Belowground traits"
+
+exposures(dag) <- c("Sub-canopy soil temperature", "Sub-canopy precipitation")
+
+adjustmentSets(dag, effect = "total")
+```
+
+Total causal effect of soil temperature on overall FD requires adjusting for air temperature.
+
+# Conditional independencies
+
+This is the full set of conditional independencies implied by the DAG, sorted by number of conditioning variables.
+
+```{r}
+ind <- impliedConditionalIndependencies(dag) |> 
+  map(\(x) {
+    x <- unclass(x)
+    x$Z <- list(x$Z)
+    x |> 
+      as_tibble() |> 
+      rename(Variable = X,
+             'Is independent of' = Y,
+             Given = Z)
+    }) |> 
+  bind_rows() |> 
+  mutate(l = map_dbl(Given, length)) |> 
+  arrange(l) |> 
+  select(!l) |> 
+  unnest_wider(Given, names_sep = "_")
+
+DT::datatable(ind)
+```
+
+## Closing thoughts
+
+For aboveground traits and overall FD, either the effect of air or soil temperature can be estimated: for simplicity, and to have a manageable number of models, we focus on air temperature. The total causal effect of soil temperature on overall FD and aboveground traits requires adjusting for air temperature, which means a separate model is needed (the total effect of air temperature is mediated by soil temperature, so it can't be included in the same model).
+
+The usual assumptions needed for causal inference still hold: unobserved confounds between exposure and outcome not biasing the estimate, or at least that the bias is smaller than the causal effect (useful approximation *sensu* Grace [-@grace2024]); the consistency rule [@pearl2009]; correct directionality of the causal relationships.
+
+## Session info
+
+```{r}
+#| echo: false
+sessioninfo::session_info()
+```

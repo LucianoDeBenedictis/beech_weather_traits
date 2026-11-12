@@ -1,0 +1,26 @@
+date: today
+
+project:
+  output-dir: notebooks
+  render:
+  - "*.qmd"
+
+toc: true
+number-sections: true
+bibliography: references.bib  
+
+format: 
+  html:
+    df-print: kable
+    embed-resources: true
+    toc-location: left
+    toc-depth: 4
+
+execute: 
+  echo: true
+  warning: false
+editor: source
+
+language:
+  en:
+    title-block-published: "Knit on"

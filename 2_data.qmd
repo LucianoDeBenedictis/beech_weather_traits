@@ -1,0 +1,410 @@
+---
+title: "Data import and setup"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+#| message: false
+#| warning: false
+# load libraries
+library(conflicted)
+library(tidyverse)
+library(readxl)
+library(FD)
+library(MASS)
+library(DT)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::recode_values)
+source("functions.R")
+
+if (!dir.exists("intermediate")) dir.create("intermediate")
+```
+
+## First steps
+
+### Test my SU aggregation function
+
+SUs are aggregated into subplots with side length 2:
+
+```{r}
+matrix(subplots(1:100, scale = 2), nrow = 10, byrow = T)
+```
+
+### Import vegetation data
+
+Cover is in $cm^2$, SU of $2500~cm^2$. The cover of a species within the same subplot grouping is summed, then converted to the proportion over the total vegetated cover.
+
+```{r}
+#| message: false
+data <- read_csv("Data/abundances.csv", trim_ws = T) |>
+  #remove bryophythes
+  filter(!species %in% c("Atrichum_undulatum", "Hypnum_cupressiforme", 
+  "Plagiomnium_affine", "Polytrichum_formosum", "Rhizomnium_punctatum")) |> 
+  #use more correct names for the plots
+  mutate(plot = recode_values(plot,
+                              "ABR01" ~ "01-ABR1",
+                              "CAL03" ~ "03-CAL1",
+                              "CAM04" ~ "04-CAM1",
+                              "VEN20" ~ "20-VEN1",
+                              default = plot)) |> 
+  #aggregate subplots in groups of 4
+  mutate(subplot = subplots(SU, scale = 2)) |> 
+  #sum covers inside subplots
+  group_by(date, plot, subplot, species) |> 
+  summarise(cover = sum(cover)) |> 
+  #convert to proportions
+  mutate(cover = cover/sum(cover)) |> 
+  ungroup()
+datatable(data)
+```
+
+Are there recorded absences?
+
+```{r}
+data |> 
+  filter(cover <= 0)
+```
+
+No, there aren't.
+
+Let's check the species names.
+
+```{r}
+#| collapse: true
+data |>
+  distinct(species) |> 
+  pull() |> 
+  sort()
+```
+
+## Count species and genera
+
+Species
+
+```{r}
+data |>
+  select(species) |> 
+  n_distinct() 
+```
+
+Genera
+
+```{r}
+data |> 
+  separate_wider_delim(species, delim = "_", names = c("genus", "species")) |> 
+  select(genus) |> 
+  n_distinct()
+```
+
+## Check the subplots before filtering
+
+At this stage, if the number of subplots is lower it is just because there were empty subplots.
+
+```{r}
+before <- data |> 
+  distinct(date, plot, subplot) |> 
+  count(date, plot) |> 
+  pivot_wider(names_from = plot, values_from = n)
+before
+```
+
+## Import the trait data
+
+```{r}
+#| message: false
+traits <- read_xlsx("Data/traits.xlsx", sheet = 1) |> 
+  select(species:persistence, la:sm, Family, Fern_Sapro)
+datatable(traits)
+```
+
+For how many species sampled do I have traits?
+
+```{r}
+unique(data$species) %in% traits$species |> 
+  mean()
+```
+
+Missing species, all three of them ".sp"
+
+```{r}
+data |> 
+  distinct(species) |> 
+  anti_join(traits[,1])
+```
+
+Unnecessary/wrong species in trait data?
+
+```{r}
+sum(!(traits$species %in% unique(data$species)))
+```
+
+No.
+
+Data only contains individuals \< 1.5 m height, remove height \>= 1.5
+
+```{r}
+traits <- traits |> 
+  mutate(ph = if_else(ph < 1.5, ph, NA))
+```
+
+Remove ferns and saprophytes
+
+```{r}
+traits <- traits |> 
+  filter(!Fern_Sapro %in% c("F", "Sapro") | is.na(Fern_Sapro))
+traits <- traits |> 
+  select(!c("Family", "Fern_Sapro"))
+```
+
+### Percent completeness across the trait table
+
+```{r}
+onlytraits <- traits |> 
+  select(!species)
+
+#overall
+100-sum(is.na(onlytraits))/prod(dim(onlytraits))*100
+
+#aboveground
+100-sum(is.na(onlytraits[5:10]))/prod(dim(onlytraits[5:10]))*100
+
+#clonal
+100-sum(is.na(onlytraits[1:4]))/prod(dim(onlytraits[1:4]))*100
+
+#by trait
+incomplete_traits <- onlytraits |> 
+  summarise(across(everything(), ~ 100-sum(is.na(.x))/n()*100)) |> 
+  print() |> 
+  #keep going to save incomplete trait names for later
+  unlist() |> 
+  (\(x) x[x < 100])() |> 
+  names()
+```
+
+## Filter SUs with missing trait data
+
+Let's remove subplots in which cover for unknown species (genus level records), ferns and saprophytes adds to \≥ 20%
+
+```{r}
+data <- data |> 
+  filter(species %in% traits$species) |> # keep species in traits tibble
+  group_by(date, plot, subplot) |> 
+  mutate(tot_cover = sum(cover)) |> # total proportion after removal
+  filter(tot_cover > 0.8) |> # keep if > 0.8
+  select(!tot_cover) |> 
+  ungroup()
+```
+
+How many removed?
+
+```{r}
+intermediate <- data |> 
+  distinct(date, plot, subplot) |> 
+  count(date, plot) |> 
+  pivot_wider(names_from = plot, values_from = n)
+
+rm_notraits <- intermediate |> 
+  mutate(across(2:5, ~ before[[cur_column()]] - .x))
+
+rm_notraits
+```
+
+## Check subplot richness
+
+```{r}
+data |> 
+  group_by(date, plot, subplot) |> 
+  count() |> 
+  ggplot(aes(x = as.factor(date), y = n))+
+  geom_dotplot(binaxis = "y", binwidth = 1, method = "histodot",
+               stackdir = "up", dotsize = 0.15, fill = "red",
+               alpha = 0.5)+
+  scale_y_continuous(limits = c(0,6), oob = scales::squish,
+                     labels = c("0", "2", "4", "6+"))+
+  labs(x = "year", y = "richness")+
+  facet_wrap(~plot)
+```
+
+Keeping subplots with at least 4 species seems like a good compromise between having enough species for FD and not removing too many subplots:
+
+```{r}
+data <- data |>
+  group_by(date, plot, subplot) |> 
+  filter(n_distinct(species) >= 4) |> 
+  ungroup()
+```
+
+## Check subplots after filtering
+
+This first table shows how many subplots have been removed for having few species:
+
+```{r}
+after <- data |> 
+  distinct(date, plot, subplot) |> 
+  count(date, plot) |> 
+  pivot_wider(names_from = plot, values_from = n)
+
+rm_fewspecies <- after |> 
+  mutate(across(2:5, ~ intermediate[[cur_column()]] - .x))
+
+rm_fewspecies
+```
+
+This shows how many are there in the end:
+
+```{r}
+after
+```
+
+This is the whole process: 1. initial; 2. after trait filtering; 3. after richness filtering.
+
+```{r}
+removal <- before |> 
+  left_join(intermediate, by = "date", suffix = c(".1", ".2")) |> 
+  left_join(after, by = "date") |> 
+  rename_with(~ paste0(., ".3"), -c(date, ends_with(c(".1", ".2"))))
+
+removal <- removal |> 
+  select(date, sort(names(removal)[-1]))
+
+removal
+```
+
+Restore subplot sums = 1 after removal
+
+```{r}
+data <- data |> 
+  group_by(date, plot, subplot) |> 
+  mutate(cover = cover/sum(cover)) |> 
+  ungroup()
+```
+
+## What's the richness in each plot and year?
+
+This is the richness after removal.
+
+```{r}
+data |> 
+  count(date, plot, species) |> 
+  count(date, plot) |> 
+  pivot_wider(names_from = plot, values_from = n)
+```
+
+## Convert to wide format for randomizations
+
+```{r}
+data <- data |> 
+  pivot_wider(names_from = species, values_from = cover, values_fill = 0)
+datatable(data)
+```
+
+## Trait transformations
+
+I'm using Box-Cox with $\lambda$ chosen by maximum likelihood. First a check:
+
+```{r}
+#| message: false
+traits |> 
+  summarise(across(where(is.numeric), ~ boxcox(., check = T)))
+```
+
+-   \~ no transform persistence
+-   \~ 1/sqrt offspring, spread, ssd
+-   \~ sqrt BBRsize, sla
+-   \~ log la, ln, height, sm
+
+Now let's actually transform:
+
+```{r}
+#| message: false
+traits <- traits |> 
+  mutate(across(where(is.numeric),  ~ boxcox(.)))
+```
+
+Check the distributions.
+
+```{r}
+traits |> 
+  select(species | where(is.numeric)) |> 
+  pivot_longer(-species, names_to = "trait", values_to = "value") |> 
+  histdensity(value)+
+  facet_wrap(~ trait, scales = "free")+
+  theme_minimal()
+```
+
+## Calculate dissimilarity matrices
+
+Species names to name the matrices
+
+```{r}
+species <- traits$species
+```
+
+### Above-ground matrix
+
+Gower distance using only the six aboveground traits
+
+```{r}
+dissim_above <- traits |> 
+  select(la:sm) |> 
+  gowdis() |> 
+  as.matrix()
+dimnames(dissim_above) <- list(species, species)
+
+#scale by maximum value
+dissim_above <- dissim_above/max(dissim_above)
+
+hist(dissim_above)
+```
+
+### Below-ground matrix
+
+Gower distance using only the four clonal traits
+
+```{r}
+dissim_below <- traits |> 
+  select(BBRsize:persistence) |> 
+  gowdis() |> 
+  as.matrix()
+
+dimnames(dissim_below) <- list(species, species)
+
+#scale by maximum value
+dissim_below <- dissim_below/max(dissim_below)
+
+hist(dissim_below)
+```
+
+### Overall matrix
+
+Average of the two so that each compartment has the same weight
+
+```{r}
+dissim_all <- (dissim_above + dissim_below) / 2
+
+dimnames(dissim_all) <- list(species, species)
+
+hist(dissim_all)
+```
+
+I'll put all three dissims into a list
+
+```{r}
+dissims <- list(overall = dissim_all, above = dissim_above, below = dissim_below)
+```
+
+## Save output
+
+```{r}
+save(data, traits, dissims, file = "intermediate/data.RData")
+```
+
+## Session info
+
+```{r}
+#| echo: false
+sessioninfo::session_info()
+```
+

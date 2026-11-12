@@ -1,0 +1,635 @@
+---
+title: "Figures"
+editor_options: 
+  chunk_output_type: console
+fig-width: 10
+fig-asp: 0.62
+---
+
+# Setup
+
+```{r}
+#| message: false
+#| warning: false
+library(conflicted)
+library(tidyverse)
+library(brms)
+library(tidybayes)
+library(ggdist)
+library(bayesplot)
+library(paletteer)
+library(patchwork)
+library(ggtext)
+library(gggrid)
+#pak::pak("teunbrand/elementalist")
+library(elementalist)
+
+source("functions.R")
+
+conflicts_prefer(dplyr::filter)
+
+options(scipen = 319)
+
+if (!dir.exists("output")) dir.create("output")
+
+theme_set(theme_minimal())
+
+#load data
+fits_fd <- readRDS("intermediate/fits_fd.rds")
+
+fits_cwm <- readRDS("intermediate/fits_cwm.rds")
+
+sites <- levels(fits_fd$data[[1]]$site)
+
+palette_pred <- set_names(paletteer_d("MetBrewer::Egypt", 4), levels(fits_fd$data[[1]]$site))
+
+palette_coef <- paletteer_d("MoMAColors::Palermo")
+```
+
+```{r}
+plot_fitted0 <- plot_fitted
+
+plot_fitted <- function(...){
+  plot_fitted0(..., pal = palette_pred, res_rib = 50)
+}
+```
+
+# Scaffolding
+
+## Plot labels
+
+```{r}
+labels <- tribble(~to, ~from,
+                  "Sub-canopy", "itp",
+                  "Open-field", "ofd",
+                  "Aboveground", "above",
+                  "Belowground", "below",
+                  "Overall", "overall",
+                  "Annual mean air temperature (°C)", "air_t_mean",
+                  "Annual mean soil temperature (°C)", "soil_t_mean",
+                  "Annual precipitation (mm)", "precipitation",
+                  "MAT", "Annual mean air temperature",
+                  "MST", "Annual mean soil temperature",
+                  "P", "Annual precipitation",
+                  "INT", "Interaction",
+                  "Bud bank size" , "BBRsize",
+                  "Leaf area (mm^2^)" , "la", 
+                  "Leaf nitrogen per mass (mg/g)" , "ln", 
+                  "Multiplication rate" , "offspring",
+                  "Persistence (years)" , "persistence",
+                  "Plant height (m)" , "ph",
+                  "Specific leaf area (mm^2^/mg)" , "sla",
+                  "Diaspore mass (mg)" , "sm",
+                  "Lateral spread (cm/year)" , "spread", 
+                  "Stem specific density (mg/mm^3^)" , "ssd")
+
+labels_vec <- labels$to |> 
+  set_names(labels$from)
+
+var_levels <- c("Annual mean air temperature",
+                "Annual mean soil temperature",
+                "Annual precipitation",
+                "Interaction")
+
+fits_fd <- fits_fd |> 
+  mutate(trait = fct(trait, levels = c("overall", "above", "below")),
+         type = fct(type, levels = c("itp", "ofd")),
+         across(c(trait, type), \(x) fct_relabel(x, \(l) labels_vec[l]),
+                .names = "{.col}_label"))
+
+fits_cwm <- fits_cwm |> 
+  mutate(trait = fct(trait, 
+                     levels = c("la", "ln", "ph", "sla", "ssd", "sm",
+                                "BBRsize", "offspring", "spread", "persistence")),
+         type = fct(type, levels = c("itp", "ofd")),
+         across(c(trait, type), \(x) fct_relabel(x, \(l) labels_vec[l]),
+                .names = "{.col}_label"))
+```
+
+## Tags
+
+Tags for sub-plots adapted from [the `gggrid` demo](https://www.stat.auckland.ac.nz/~paul/Reports/gggrid/gggrid.html).
+
+```{r}
+tagger <- function(tag){
+  size <- unit(1, "lines")
+  bg <- rectGrob(gp = gpar(fill = "black"))
+  lab <- textGrob(tag, gp = gpar(col="white"))
+  vp <- viewport(x = 1, y = 1, 
+                 width = size,
+                 height = size,
+                 just=c("right", "top"))
+  gTree(children = gList(bg, lab), vp=vp)
+}
+
+tags <- letters |> 
+  map(tagger)
+```
+
+## Data ranges
+
+Check the range of the x axes so they can be consistent across plots.
+
+```{r}
+fits_fd |> 
+  bind_rows(fits_cwm) |> 
+  mutate(var = map(fit, \(x) str_subset(names(x$data), "air|soil|prec"))) |> 
+  unnest(var) |> 
+  mutate(var = str_remove(var, "_centered$"),
+         rng = map2(data, var,
+                    \(x, y) x |> 
+                      select(all_of(y)) |>
+                      pull() |> 
+                      range())) |> 
+  unnest_wider(rng, names_sep = "_") |> 
+  select(trait, type, var, rng_1, rng_2) |> 
+  mutate(across(rng_1:rng_2, 
+                \(x) if_else(str_detect(var, "prec"), x * 600, x * 2.5)),
+         var = if_else(str_detect(var, "prec"), var, "temperature")) |> 
+  pivot_wider(names_from = var, values_from = rng_1:rng_2,
+              names_glue = "{var}_{.value}",
+              names_vary = "slowest") |> 
+  arrange(type, trait)
+
+xlim_p <- c(0, 2999)
+xlim_t <- c(2, 14)
+```
+
+# Functional diversity models
+
+## Posterior predictive simulations
+
+The expectation of the relationship is plotted, with the uncertainty shown by a gradient corresponding to interval width. This representation has the advantages of showing changes in terms of actual values of exposure and response and properly incorporating interactions, here shown as a triptych plot at three different levels of the other variable (site mean, $\pm$ 1 approximate standard deviation).
+As reference, observations are plotted, colored by site, even if the regression line is for the average site. For multiply imputed data, points are averaged across imputations.
+
+```{r}
+plots_fd0 <- fits_fd |>
+  #generate variable pairs
+  mutate(var = map(fit, \(x) str_subset(names(x$data), "air|soil|prec"))) |> 
+  unnest(var) |> 
+  arrange(type, trait) |> 
+  mutate(range = map(var, \(x) if(str_detect(x, "prec")) xlim_p else xlim_t)) |> 
+  #add plots
+  mutate(plot = pmap(list(fit, data, var, range), 
+                     \(x, y, z, w) plot_fitted(x, y, z, range_1 = w))) |> 
+  mutate(plot = map(plot,
+                    \(x) {
+                      xlab <- x@mapping$x |> 
+                        as_label() |> 
+                        str_remove("_centered")
+                      x +
+                        labs(x = labels_vec[xlab],
+                             y = "FD-SES")
+                    }))
+```
+
+### Sub-canopy models
+
+```{r}
+plots_fd0_itp <- plots_fd0 |> 
+  filter(type == "itp") |> 
+  mutate(id = row_number(),
+         plot = map2(plot, id,
+                     \(x, y, z) x +
+                       #add tags
+                       grid_panel(tags[[y]]))) |> 
+  pull(plot)
+
+lab_h  <- grobHeight(textGrob("Overall")) + 2 * unit(6, "pt")
+plot_h <- unit(1, "null")
+
+wrap_plots(
+  textGrob("Overall"),
+  plots_fd0_itp[[1]], plots_fd0_itp[[2]],
+  textGrob("Aboveground"),
+  plots_fd0_itp[[3]], plots_fd0_itp[[4]],
+  textGrob("Belowground"),
+  plots_fd0_itp[[5]], plots_fd0_itp[[6]],
+  guide_area()
+) +
+  plot_layout(
+    axes    = "collect_y",
+    guides  = "collect",
+    widths  = c(1, 1, 0.25),
+    heights = unit.c(lab_h, plot_h),
+    design  = "AAJ
+               BCJ
+               DDJ
+               EFJ
+               GGJ
+               HIJ"
+  )
+
+ggsave("output/pred_fd_itp.png", width = 6, height = 6, units = "in", bg = "white", scale = 1.5)
+```
+
+## With interactions
+
+```{r}
+plots_fd <- fits_fd |>
+  #generate variable pairs
+  mutate(var = map(fit, \(x) str_subset(names(x$data), "air|soil|prec"))) |> 
+  unnest_wider(var, names_sep = "") |> 
+  arrange(type, trait) |> 
+  #add plots
+  mutate(plot = pmap(list(fit, data, var1, var2), 
+                     \(x, y, v1, v2) plot_fitted(x, y, v1, v2,
+                                                 range_1 = xlim_t,
+                                                 range_2 = xlim_p))) |> 
+  mutate(plot = map2(plot, trait_label,
+                    \(p, l) imap(p, \(x, idx){
+                      xlab <- x@mapping$x |> 
+                        as_label() |> 
+                        str_remove("_centered")
+                      x +
+                        labs(x = labels_vec[xlab],
+                             y = "FD-SES",
+                             title = idx)
+                      }) |> 
+                      (\(p) map2(p, seq_along(p),
+                                 \(x, idx) x +
+                                   grid_panel(tags[[idx]])))() |> 
+                      wrap_plots(ncol = 3, guides = "collect", axes = "collect") +
+                      plot_annotation(title = l) &
+                      theme(plot.title = element_text(size = 11, hjust = 0.5),
+                            legend.position = "bottom")) |> 
+           set_names(str_to_lower(trait_label)))
+
+
+```
+
+### Sub-canopy models
+
+```{r}
+#| fig-width: 10 
+#| fig-asp: 0.62
+
+pred_fd_itp <- plots_fd |> 
+  filter(type == "itp") |> 
+  pull(plot)
+
+pred_fd_itp
+
+pred_fd_itp |> 
+  iwalk(\(x, idx) ggsave(str_c("output/pred_fd_", idx, "_itp.png"), x,
+                         width = 6, height = 4.5, units = "in", bg = "white", scale = 1.5))
+```
+
+### Open-field models:
+
+```{r}
+#| fig-width: 10
+#| fig-asp: 0.62
+
+pred_fd_ofd <- plots_fd |> 
+  filter(type == "ofd") |> 
+  pull(plot)
+
+pred_fd_ofd
+
+pred_fd_ofd |> 
+  iwalk(\(x, idx) ggsave(str_c("output/pred_fd_", idx, "_ofd.png"), x,
+                         width = 6, height = 4.5, units = "in", bg = "white", scale = 1.5))
+```
+
+## Slope coefficients
+
+One way to summarize the results is to show the regression coefficients by their means, 50%, 80% and 95% highest-density continuous intervals. Despite the gaussian likelihood and identity link, care must be taken in the interpretation because of the interaction term, which means effects of one variable depend on the level of the other (in other words, models with interaction terms are not linear).
+
+```{r}
+coefs_fd <- fits_fd |> 
+  mutate(coef = map(fit, 
+                    \(x) x |> 
+                      as_draws_df() |> 
+                      as_tibble() |> 
+                      select(matches(c("air", "soil", "prec"))) |> 
+                      pivot_longer(everything(), names_to = "var") |> 
+                      mutate(var = str_remove_all(var, "b_|_centered")) |> 
+                      group_by(var) |> 
+                      mean_hdci(.width = c(0.5, 0.8, 0.95)))) |> 
+  select(!c(fit, data)) |> 
+  unnest(coef) |> 
+  mutate(var_label = recode_values(var, from = labels$from, to = labels$to,
+                             default = "Interaction") |> 
+                     str_remove(" \\(.+\\)$") |> 
+                     fct(levels = var_levels),
+         var_short = fct_relabel(var_label, \(x) labels_vec[x])) |> 
+  arrange(trait_label, var_label) |> 
+  mutate(ylab = fct(str_c(var_label, trait_label, sep = ", ")))
+
+coefs_fd |> 
+  ggplot(aes(y = fct_rev(trait_label),
+             x = value,
+             xmin = .lower,
+             xmax = .upper,
+             )) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  geom_pointinterval(aes(interval_color = factor(.width)),
+                     point_colour = palette_coef[1],
+                     interval_size_domain = c(1, 4),
+                     fatten_point = 1.5,
+                     show.legend = c(size = F, interval_color = F)) +
+  scale_color_manual(values = palette_coef[2:4], aesthetics = "interval_color") +
+  facet_grid(rows = vars(var_short),
+             cols = vars(type_label),
+             scales = "free_y",
+             space = "free_y",
+             switch = "y") +
+  labs(x = NULL, y = NULL) +
+  theme(panel.grid.major.y = element_blank(),
+        axis.text.y = element_text(hjust = 0),
+        panel.spacing.y = unit(0, "npc"),
+        strip.placement = "outside",
+        strip.background.y = element_rect_round(fill = "grey90", radius = 0.5,
+                                                linetype = 0))
+  
+ggsave("output/coefs_fd.png", width = 6, height = 4, units = "in", bg = "white", scale = 1.2)
+```
+
+# Cover-weighted trait models
+
+## Posterior predictive simulations without interactions
+
+```{r}
+plots_cwm0 <- fits_cwm |> 
+  #pull out model family
+  mutate(family = map_chr(fit, list("formula", "family", "family"))) |> 
+  #generate exposures
+  mutate(var = map(fit, \(x) str_subset(names(x$data), "air|soil|prec"))) |> 
+  unnest(var) |> 
+  arrange(type, trait) |> 
+  mutate(range = map(var, \(x) if(str_detect(x, "prec")) xlim_p else xlim_t)) |> 
+  #add plots
+  mutate(plot = pmap(list(fit, data, var, range),
+                     \(x, y, z, w) plot_fitted(x, y, z,
+                                            wt = "cov_wt", range_1 = w))) |> 
+  mutate(plot = pmap(list(plot, trait_label, family),
+                     \(x, y, z){
+                       xlab <- x@mapping$x |> 
+                         as_label() |> 
+                         str_remove("_centered")
+                       p <- x +
+                         labs(x = labels_vec[xlab],
+                              y = y) +
+                         theme(axis.title.y = element_markdown())
+                       #use log scale for lognormal models
+                       if(str_detect(z, "^lognormal")) p + scale_y_log10() else p
+                       }))
+```
+
+```{r}
+plots_cwm0 |> 
+  filter(trait %in% c("la", "ph", "sm")) |> 
+  pull(plot) |> 
+  imap(\(x, idx) x +
+         grid_panel(tags[[idx]])) |> 
+  wrap_plots(ncol = 2, axes = "collect", guides = "collect", byrow = T)
+
+ggsave("output/pred_cwm_1.png", width = 6, height = 6, units = "in", bg = "white", scale = 1.5)
+```
+
+```{r}
+plots_cwm0 |> 
+  filter(trait %in% c("ln", "sla", "ssd")) |> 
+  pull(plot) |>
+  imap(\(x, idx) x +
+         grid_panel(tags[[idx]])) |> 
+  wrap_plots(ncol = 2, axes = "collect", guides = "collect", byrow = T)
+
+ggsave("output/pred_cwm_2.png", width = 6, height = 6, units = "in", bg = "white", scale = 1.5)
+```
+
+```{r}
+plots_cwm0 |> 
+  filter(trait %in% c("BBRsize", "offspring", "spread", "persistence")) |> 
+  pull(plot) |> 
+  imap(\(x, idx) x +
+         grid_panel(tags[[idx]])) |>
+  wrap_plots(ncol = 2, axes = "collect", guides = "collect", byrow = T)
+
+ggsave("output/pred_cwm_3.png", width = 6, height = 6, units = "in", bg = "white", scale = 1.5)
+```
+
+## With interactions
+
+```{r}
+plots_cwm <- fits_cwm |> 
+  #pull out model family
+  mutate(family = map_chr(fit, list("formula", "family", "family"))) |> 
+  #generate variable pairs
+  mutate(var = map(fit, \(x) str_subset(names(x$data), "air|soil|prec"))) |> 
+  unnest_wider(var, names_sep = "") |> 
+  arrange(type, trait) |> 
+  #add plots
+  mutate(plot = pmap(list(fit, data, var1, var2),
+                     \(x, y, v1, v2) plot_fitted(x, y, v1, v2,
+                                                 wt = "cov_wt",
+                                                 range_1 = xlim_t,
+                                                 range_2 = xlim_p))) |> 
+  mutate(plot = pmap(list(plot, trait_label, family),
+                     \(p, l, f) imap(p, \(x, idx){
+                       xlab <- x@mapping$x |> 
+                         as_label() |> 
+                         str_remove("_centered")
+                       plot <- x +
+                         labs(x = labels_vec[xlab],
+                              y = l,
+                              title = idx)
+                       #use log scale for lognormal models
+                       if(str_detect(f, "^lognormal")) plot + scale_y_log10() else plot
+                     }) |> 
+                       (\(t) map2(t, seq_along(t),
+                                  \(x, idx) x +
+                                    grid_panel(tags[[idx]])))() |> 
+                       wrap_plots(ncol = 3, guides = "collect", axes = "collect") &
+                       theme(plot.title = element_text(size = 11, hjust = 0.5),
+                             axis.title.y = element_markdown(),
+                             legend.position = "bottom")))
+
+plots_cwm |>
+  select(trait, trait_label, family)
+```
+
+### Leaf area
+
+```{r}
+plots_cwm |> 
+  filter(trait == "la") |> 
+  pluck("plot", 1)
+```
+
+### Nitrogen
+
+```{r}
+plots_cwm |> 
+  filter(trait == "ln") |> 
+  pluck("plot", 1)
+```
+
+### Height
+
+```{r}
+plots_cwm |> 
+  filter(trait == "ph") |> 
+  pluck("plot", 1)
+```
+
+### Specific leaf area
+
+```{r}
+plots_cwm |> 
+  filter(trait == "sla") |> 
+  pluck("plot", 1)
+```
+
+### Stem-specific density
+
+Records of high cover and SSD in 03-CAL1 are from *Ruscus aculeatus*. Notice how these don't skew the regression upwards because we're estimating within-site effects and the cover is roughly constant within that site.
+
+```{r}
+plots_cwm |> 
+  filter(trait == "ssd") |> 
+  pluck("plot", 1)
+```
+
+### Diaspore mass
+
+Small-seeded records are from genus *Epipactis*.
+
+```{r}
+plots_cwm |> 
+  filter(trait == "sm") |> 
+  pluck("plot", 1)
+```
+
+### Bud band incl. root
+
+```{r}
+plots_cwm |> 
+  filter(trait == "BBRsize") |> 
+  pluck("plot", 1)
+```
+
+### Multiplication rate
+
+```{r}
+plots_cwm |> 
+  filter(trait == "offspring") |> 
+  pluck("plot", 1)
+```
+
+### Lateral spread
+
+```{r}
+plots_cwm |> 
+  filter(trait == "spread") |> 
+  pluck("plot", 1)
+```
+
+### Persistence
+
+```{r}
+plots_cwm |> 
+  filter(trait == "persistence") |> 
+  pluck("plot", 1)
+```
+
+### Save plots
+
+```{r}
+with(plots_cwm, walk2(plot, trait,
+                      \(x, y) ggsave(str_c("output/pred_cwm_", y, ".png"), x,
+                                     width = 6, height = 4.5, units = "in", bg = "white", scale = 1.5)))
+```
+
+## Slope coefficients
+
+In addition to the previous warnings, even more caution must be exercised interpreting this plot, because different models use different link functions and data models.
+
+```{r}
+coefs_cwm <- fits_cwm |> 
+  mutate(coef = map(fit, 
+                    \(x) x |> 
+                      as_draws_df() |> 
+                      as_tibble() |> 
+                      select(matches(c("air", "soil", "prec"))) |> 
+                      pivot_longer(everything(), names_to = "var") |> 
+                      mutate(var = str_remove_all(var, "b_|_centered")) |> 
+                      group_by(var) |> 
+                      mean_hdci(.width = c(0.5, 0.8, 0.95)))) |> 
+  select(!c(data, fit)) |> 
+  unnest(coef) |> 
+  mutate(hu = if_else(str_detect(var, "hu"), T, F),
+         var = str_remove(var, "hu_")) |> 
+  mutate(var_label = recode_values(var, from = labels$from, to = labels$to,
+                             default = "Interaction") |> 
+                     str_remove(" \\(.+\\)$") |> 
+                     fct(levels = var_levels),
+         var_short = fct_relabel(var_label, \(x) labels_vec[x])) |> 
+  arrange(hu, trait_label, var_label) |> 
+  mutate(ylab = fct(str_c(var_label, trait_label, sep = ", "))) |> 
+  nest(.by = hu, .key = "coefs")
+
+coefs_cwm$coefs[[1]] |> 
+  ggplot(aes(y = fct_rev(trait_label),
+             x = value,
+             xmin = .lower,
+             xmax = .upper,
+             )) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  geom_pointinterval(aes(interval_color = factor(.width)),
+                     point_colour = palette_coef[1],
+                     interval_size_domain = c(1, 4),
+                     fatten_point = 1.5,
+                     show.legend = c(size = F, interval_color = F)) +
+  scale_color_manual(values = palette_coef[2:4], aesthetics = "interval_color") +
+  facet_grid(rows = vars(var_short),
+             scales = "free_y",
+             space = "free_y",
+             switch = "y") +
+  labs(x = NULL, y = NULL, title = "Main model coefficients") +
+  theme(panel.grid.major.y = element_blank(),
+        axis.text.y = element_text(hjust = 0),
+        panel.spacing.y = unit(0, "npc"),
+        strip.placement = "outside",
+        strip.background.y = element_rect_round(fill = "grey90", radius = 0.5,
+                                                linetype = 0),
+        plot.title = element_text(hjust = 0.5))
+
+ggsave("output/coefs_cwm_main.png", width = 6, height = 4, units = "in", bg = "white", scale = 1.2)
+
+coefs_cwm$coefs[[2]] |> 
+  ggplot(aes(y = fct_rev(trait_label),
+             x = value,
+             xmin = .lower,
+             xmax = .upper,
+             )) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  geom_pointinterval(aes(interval_color = factor(.width)),
+                     point_colour = palette_coef[1],
+                     interval_size_domain = c(1, 4),
+                     fatten_point = 1.5,
+                     show.legend = c(size = F, interval_color = F)) +
+  scale_color_manual(values = palette_coef[2:4], aesthetics = "interval_color") +
+  facet_grid(rows = vars(var_short),
+             scales = "free_y",
+             space = "free_y",
+             switch = "y") +
+  labs(x = NULL, y = NULL, title = "Hurdle model coefficients") +
+  theme(panel.grid.major.y = element_blank(),
+        axis.text.y = element_text(hjust = 0),
+        panel.spacing.y = unit(0, "npc"),
+        strip.placement = "outside",
+        strip.background.y = element_rect_round(fill = "grey90", radius = 0.5,
+                                                linetype = 0),
+        plot.title = element_text(hjust = 0.5))
+
+ggsave("output/coefs_cwm_hu.png", width = 6, height = 4, units = "in", bg = "white", scale = 1.2)
+```
+
+# Session info
+
+```{r}
+#| echo: false
+sessioninfo::session_info()
+```

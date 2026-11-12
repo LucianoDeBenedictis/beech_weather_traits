@@ -1,0 +1,755 @@
+---
+title: "Cover-weighted trait models"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+```{r}
+#| message: false
+#| warning: false
+library(conflicted)
+library(tidyverse)
+library(tidybayes)
+library(distributional)
+library(brms)
+library(ggdist)
+library(bayesplot)
+library(patchwork)
+
+source("functions.R")
+
+conflicts_prefer(dplyr::filter,
+                 stats::lag,
+                 distributional::parameters,
+                 brms::ar,
+                 brms::dstudent_t,
+                 brms::pstudent_t,
+                 brms::qstudent_t,
+                 brms::rstudent_t,
+                 brms::rhat)
+
+options(mc.cores = parallel::detectCores())
+options(brms.file_refit = "on_change")
+options(brms.backend = "cmdstanr")
+options(contrasts = c("contr.sum", "contr.poly"))
+
+options(digits = 3)
+
+set.seed(2058)
+
+if (!dir.exists("fits/cwm")) dir.create("fits/cwm", recursive = T)
+
+theme_set(theme_minimal())
+
+cwm_ITP <- readRDS("intermediate/cwm_itp.rds")
+
+show <- vars(!c(lprior, lp__, b_Intercept))
+```
+
+```{r}
+#this emulates ppc_dens_overlay but weighs observations and predictions by cover
+my_ppc <- function(fit, data, weight = "cov_wt", range = T){
+  resp <- fit[["formula"]][["resp"]]
+  
+  #if data comes from multiple imputations, average across them
+  if(is.data.frame(data[[1]])){
+    data <- data |>
+      map(\(x) x |> 
+            mutate(id = row_number())) |> 
+      bind_rows() |> 
+      summarise(across(everything(), \(x) if(is.numeric(x)) mean(x) else first(x)), .by = id) |> 
+      mutate(cov_wt = cov_wt / sum(cov_wt),
+             site = fct_drop(site))
+  }
+  
+  preds <- predicted_draws(fit, data, ndraws = 10)
+  
+  plot <- preds |> 
+    ggplot(aes(y = after_stat(wdensity), weight = .data[[weight]])) +
+    geom_density(aes(x = .prediction, group = .draw), colour = alpha("#005b96", 0.25)) +
+    geom_density(aes(x = .data[[resp]]), data = data)
+  
+  if(range){
+    plot +
+      coord_cartesian(xlim = range(data[[resp]]))
+  } else plot
+}
+
+my_resplot <- function(fit, data, ndraws = 500){
+  fit |> 
+    residual_draws(data |> 
+                     mutate(site = fct_drop(site)),
+                   ndraws = ndraws) |> 
+    as_tibble() |> 
+    ggplot(aes(x = .row, y = .residual, alpha = cov_wt)) +
+    stat_pointinterval(.width = 0.95, show.legend = F)
+}
+```
+
+# Priors 
+
+## Gaussian
+
+See the previous notebooks for more information about prior choice.
+
+## Lognormal
+
+For a log-normal distribution, the two independent parameters are median $exp(u)$ and CV $\sqrt{exp(\sigma^{2})-1}$.
+
+```{r}
+expand_grid(meanlog = seq(-1, 2, by = 0.5),
+            sdlog = c(0.1, 0.5, 1),
+            seq = seq(from = 0, to = 20, length.out = 400)) |> 
+  mutate(d   = dlnorm(seq, meanlog, sdlog),
+         mu  = str_c("mu[log]==", meanlog),
+         sigma = str_c("sigma[log]==", sdlog)) |>
+  ggplot(aes(x = seq, y = d)) +
+  geom_area(fill = "grey50") +
+  scale_y_continuous("density", breaks = NULL) +
+  ggtitle(expression("Log-normal given different combinations of "*mu[log]*" and "*sigma[log])) +
+  facet_grid(mu ~ sigma, labeller = label_parsed, scales = "free")
+```
+
+We can see that the default prior, with the predictors at their means, the median value is likely change over more than four orders of magnitude (for scaled traits). This is far too wide.
+
+```{r}
+tibble(x = rstudent_t(1e4, 3, 0, 2.5)) |> 
+  ggplot(aes(x = x)) +
+  stat_halfeye(fill = "brown") +
+  scale_x_continuous(labels = \(x) str_c("\u00d7", signif(exp(x), 2)),
+                     limits = c(-10, 10)) +
+  labs(title = "Default prior for Intercept",
+       x = "Median",
+       y = NULL)
+```
+
+The adjusted prior is still wide but more reasonable.
+
+```{r}
+tibble(x = rstudent_t(1e4, 3, 0, 0.6)) |> 
+  ggplot(aes(x = x)) +
+  stat_halfeye(fill = "slategray3") +
+  scale_x_continuous(labels = \(x) str_c("\u00d7", signif(exp(x), 2)),
+                     limits = c(-4, 4)) +
+  labs(title = "Adjusted prior for Intercept",
+       x = "Median",
+       y = NULL)
+```
+
+Here's the proposed prior for $\beta$ in relative terms:
+
+```{r}
+tibble(x = rstudent_t(1e4, 5, 0, 0.5)) |> 
+  ggplot(aes(x = x)) +
+  stat_halfeye(fill = "lightsalmon") +
+  scale_x_continuous(labels = \(x) str_c("\u00d7", signif(exp(x), 2)),
+                     limits = c(-3, 3),
+                     breaks = -3:3) +
+  labs(title = expression("Adjusted prior for"~beta),
+       x = "Difference in medians",
+       y = NULL)
+```
+
+And for $\sigma$:
+
+```{r}
+tibble(r = generate(dist_truncated(dist_student_t(5, 0, 0.5), 0), 1e4)[[1]],
+       x = sqrt(exp(r^2) - 1)) |> 
+  ggplot(aes(x = x)) +
+  stat_halfeye(fill = "khaki3") +
+  xlim(NA, 6) +
+  labs(title = "Prior for sigma in terms of CV",
+       x = "CV")
+```
+
+## Hurdle
+
+```{r}
+ggplot()+
+  geom_function(fun = plogis) +
+  xlim(-8, 8) +
+  ggtitle("The logistic function")
+
+tibble(x = rlogis(1e5, 0, 1) |> plogis()) |> 
+  ggplot(aes(x = x)) +
+  geom_density(fill = "thistle3", colour = NA) +
+  ggtitle("Default prior for hurdle intercept")
+
+tibble(x = rnorm(1e5, 0, 1) |> plogis()) |> 
+  ggplot(aes(x = x)) +
+  stat_slab(fill = "honeydew3") +
+  ggtitle(expression("Prior for hurdle"~beta~"on the probability scale"))
+```
+
+## Store the priors
+
+The following function emulates the default behaviour of `brms` for the intercept prior, using the outcome median as mean, but using the adjusted df and sd.
+
+```{r}
+#prior for gaussian models
+prior_itp <- c(prior(normal(0, 1), class = "b"),
+               prior(student_t(3, 0, 0.7), class = "b", coef = "site1"),
+               prior(student_t(3, 0, 0.7), class = "b", coef = "site2"),
+               prior(student_t(3, 0, 0.5), class = "sigma", lb = 0))
+
+#prior for lognormal models
+prior_ln <- function(outcome, hu = F){
+  md <- outcome |> median() |> log() |> round(3)
+  prior <- c(set_prior(str_c("student_t(3, ", md, ", 0.6)"), class = "Intercept"),
+             prior(student_t(5, 0, 0.5), class = "b"),
+             prior(student_t(5, 0, 0.5), class = "sigma", lb = 0))
+  
+  if(hu) prior <- c(prior, prior(normal(0,1), class = "b", dpar = "hu"))
+  return(prior)
+}
+```
+
+## Prior predictive simulation
+
+```{r}
+data_prior <- tibble(x = seq(-2, 2, length.out = 10),
+                     cover = seq(0, 4, length.out = 10)) |>
+  expand_grid(outcome = c(0, 1),
+              z = seq(-2, 2, length.out = 10),
+              site = letters[1:4])
+
+prior_pred <- brm(bf(outcome ~ x + z + x:z + cover + site,
+                     hu ~ x + z + x:z + cover + site),
+             data = data_prior,
+             prior = prior_ln(data_prior$outcome, hu = T),
+             sample_prior = "only",
+             family = "hurdle_lognormal",
+             file = "fits/prior_h_ln",
+             seed = 2853)
+
+#lognormal model
+prior_pred |> 
+  spread_draws(Intercept, b_site1, sigma) |> 
+  slice_sample(n = 100) |> 
+  mutate(site1 = Intercept + b_site1) |> 
+  pivot_longer(c(Intercept, site1)) |> 
+  expand_grid(x = seq(0, 10, length.out = 100)) |> 
+  mutate(density = dlnorm(x, value, sigma)) |> 
+  ggplot(aes(x = x, y = density, group = .draw)) +
+  geom_line(alpha = 0.2) +
+  coord_cartesian(ylim = c(0, 10)) +
+  facet_wrap(vars(name))
+
+#hurdle model
+prior_pred |> 
+  spread_draws(Intercept_hu, b_hu_site1) |> 
+  mutate(site1 = Intercept_hu + b_hu_site1) |> 
+  pivot_longer(c(Intercept_hu, site1)) |>
+  mutate(value = plogis(value)) |> 
+  ggplot(aes(x = value)) +
+  geom_density(fill = "grey40") +
+  facet_wrap(vars(name))
+```
+
+# Years included in the models
+
+The years considered across all models are:
+
+```{r}
+years_across <- cwm_ITP$data |> 
+  map(1) |> 
+  bind_rows() |> 
+  distinct(year) |> 
+  mutate(year = as.character(year)) |> 
+  arrange(year) |> 
+  pull()
+
+years_across
+```
+
+This corresponds to a timespan of `{r} as.numeric(years_across) |> range() |> diff() |> sum(1)` years.
+
+The years included are the same for all models:
+
+```{r}
+cwm_ITP |> 
+  mutate(years_diff = map_dbl(data,
+                              \(x) x |> 
+                                pluck(1) |> 
+                                distinct(year) |> 
+                                mutate(year = as.character(year)) |> 
+                                pull() |> 
+                                setdiff(years_across) |> 
+                                length())) |> 
+  select(!data)
+```
+
+while the number of site-years differs because of different trait filtering
+
+```{r}
+cwm_ITP |> 
+  mutate(site_years = map_dbl(data,
+                              \(x) x |> 
+                                pluck(1) |> 
+                                distinct(site, year) |> 
+                                nrow())) |> 
+  select(!data)
+```
+
+# Prepare data
+
+```{r}
+variables <- c("air_t_mean", "soil_t_mean", "precipitation")
+
+sds <- c(2.5, 2.5, 600) |> 
+  set_names(variables)
+
+prepare <- function(data, out, vars = variables) {
+  
+  #some processing is applied to both exposure and outcome
+  full_var <- c(out, vars)
+  
+  # SD for the outcome
+  sds <- data[[1]] |> 
+    summarise(sd_out = sd(.data[[out]])) |> 
+    pull(sd_out) |> 
+    set_names(out) |> 
+    c(sds)
+  
+  data |> 
+    map(\(x) {
+      x |> 
+        mutate(across(all_of(full_var), 
+                      \(x) sds[[cur_column()]], 
+                      .names = "{.col}_sd"),
+               across(all_of(full_var), 
+                      \(x) x / sds[[cur_column()]]),
+               #cover as proportion 0-4
+               cover = cover / 100 * 4) |> 
+        # calculate site grand means
+        mutate(across(all_of(vars), mean, 
+                      .names = "{.col}_site"),
+               across(all_of(vars),
+                      \(x) x - get(str_c(cur_column(), "_site")),
+                      .names = "{.col}_centered"),
+               .by = site)
+    })
+}
+
+cwm_ITP <- cwm_ITP |> 
+  mutate(data = map2(data, trait, prepare) |> 
+           set_names(trait))
+```
+
+# Sub-canopy weather
+
+## Leaf area
+
+```{r}
+fit_la_itp <- brm_multiple(la | weights(cov_wt, scale = TRUE) ~ 
+                             air_t_mean_centered + precipitation_centered +
+                             air_t_mean_centered:precipitation_centered + cover + site,
+                           data = cwm_ITP$data$la,
+                           prior = prior_ln(cwm_ITP$data$la[[1]]$la),
+                           family = "lognormal",
+                           file = "fits/cwm/la.itp",
+                           file_refit = "never",
+                           control = list(seed = 2853))
+
+prior_summary(fit_la_itp)
+
+fit_la_itp
+
+multiple_convergence(fit_la_itp)
+
+my_mcmc_pairs(fit_la_itp)
+
+trank(fit_la_itp)
+
+my_ppc(fit_la_itp, cwm_ITP$data$la)
+
+my_resplot(fit_la_itp, cwm_ITP$data$la[[1]])
+
+mcmc_intervals(fit_la_itp, pars = show)
+
+my_ceffects(fit_la_itp)
+```
+
+## Leaf nitrogen
+
+```{r}
+fit_ln_itp <- brm_multiple(ln | weights(cov_wt, scale = TRUE) ~ 
+                             air_t_mean_centered + precipitation_centered +
+                             air_t_mean_centered:precipitation_centered + cover + site,
+                           data = cwm_ITP$data$ln,
+                           prior = prior_ln(cwm_ITP$data$ln[[1]]$ln),
+                           family = "lognormal",
+                           file = "fits/cwm/ln.itp",
+                           file_refit = "never",
+                           control = list(seed = 2853))
+
+prior_summary(fit_ln_itp)
+
+fit_ln_itp
+
+multiple_convergence(fit_ln_itp)
+
+my_mcmc_pairs(fit_ln_itp)
+
+trank(fit_ln_itp)
+
+my_ppc(fit_ln_itp, cwm_ITP$data$ln)
+
+my_resplot(fit_ln_itp, cwm_ITP$data$ln[[1]])
+
+mcmc_intervals(fit_ln_itp, pars = show)
+
+my_ceffects(fit_ln_itp)
+```
+
+## Plant height
+
+```{r}
+fit_ph_itp <- brm_multiple(ph | weights(cov_wt, scale = TRUE) ~ 
+                             air_t_mean_centered + precipitation_centered +
+                             air_t_mean_centered:precipitation_centered + cover + site,
+                           data = cwm_ITP$data$ph,
+                           prior = prior_ln(cwm_ITP$data$ph[[1]]$ph),
+                           family = "lognormal",
+                           file = "fits/cwm/ph.itp",
+                           file_refit = "never",
+                           control = list(seed = 2853))
+
+prior_summary(fit_ph_itp)
+
+fit_ph_itp
+
+multiple_convergence(fit_ph_itp)
+
+my_mcmc_pairs(fit_ph_itp)
+
+trank(fit_ph_itp)
+
+my_ppc(fit_ph_itp, cwm_ITP$data$ph)
+
+my_resplot(fit_ph_itp, cwm_ITP$data$ph[[1]])
+
+mcmc_intervals(fit_ph_itp, pars = show)
+
+my_ceffects(fit_ph_itp)
+```
+
+## Specific leaf area
+
+```{r}
+fit_sla_itp <- brm_multiple(sla | weights(cov_wt, scale = TRUE) ~ 
+                              air_t_mean_centered + precipitation_centered +
+                              air_t_mean_centered:precipitation_centered + cover + site,
+                            data = cwm_ITP$data$sla,
+                            prior = prior_ln(cwm_ITP$data$sla[[1]]$sla),
+                            family = "lognormal",
+                            file = "fits/cwm/sla.itp",
+                            file_refit = "never",
+                            control = list(seed = 2853))
+
+prior_summary(fit_sla_itp)
+
+fit_sla_itp
+
+multiple_convergence(fit_sla_itp)
+
+my_mcmc_pairs(fit_sla_itp)
+
+trank(fit_sla_itp)
+
+my_ppc(fit_sla_itp, cwm_ITP$data$sla)
+
+my_resplot(fit_sla_itp, cwm_ITP$data$sla[[1]])
+
+mcmc_intervals(fit_sla_itp, pars = show)
+
+my_ceffects(fit_sla_itp)
+```
+
+## Stem-specific density
+
+*Ilex aquifolium* and *Ruscus aculeatus* have clearly higher SSD than the rest. While they are woody shrubs, there are other shrubs and woody species with lower values, so this doesn't fully account for the differences.
+
+```{r}
+fit_ssd_itp <- brm_multiple(ssd | weights(cov_wt, scale = TRUE) ~ 
+                              air_t_mean_centered + precipitation_centered +
+                              air_t_mean_centered:precipitation_centered + cover + site,
+                            data = cwm_ITP$data$ssd,
+                            prior = prior_itp,
+                            file = "fits/cwm/ssd.itp",
+                            file_refit = "never",
+                            control = list(seed = 2853))
+
+prior_summary(fit_ssd_itp)
+
+fit_ssd_itp
+
+multiple_convergence(fit_ssd_itp)
+
+my_mcmc_pairs(fit_ssd_itp)
+
+trank(fit_ssd_itp)
+
+my_ppc(fit_ssd_itp, cwm_ITP$data$ssd, range = F)
+
+my_resplot(fit_ssd_itp, cwm_ITP$data$ssd[[1]])
+
+mcmc_intervals(fit_ssd_itp, pars = show)
+
+my_ceffects(fit_ssd_itp)
+```
+
+## Seed mass
+
+Like for SSD, the exceptionally large seed mass of *Ruscus aculeatus* isn't well accounted for by the data model.
+
+```{r}
+fit_sm_itp <- brm_multiple(sm | weights(cov_wt, scale = TRUE) ~ 
+                             air_t_mean_centered + precipitation_centered +
+                             air_t_mean_centered:precipitation_centered + cover + site,
+                           data = cwm_ITP$data$sm,
+                           prior = prior_ln(cwm_ITP$data$sm[[1]]$sm),
+                           family = "lognormal",
+                           file = "fits/cwm/sm.itp",
+                           file_refit = "never",
+                           control = list(seed = 2853))
+
+prior_summary(fit_sm_itp)
+
+fit_sm_itp
+
+multiple_convergence(fit_sm_itp)
+
+my_mcmc_pairs(fit_sm_itp)
+
+trank(fit_sm_itp)
+
+my_ppc(fit_sm_itp, cwm_ITP$data$sm)
+
+my_resplot(fit_sm_itp, cwm_ITP$data$sm[[1]])
+
+mcmc_intervals(fit_sm_itp, pars = show)
+
+my_ceffects(fit_sm_itp)
+```
+
+## Bud Bank (incl. root)
+
+While this clonal trait is in principle a discrete count (bud in BB organs per rooting unit), its averaging across measurements and datasets results in a variable which is more similar to continuous. This supports the use of Gaussian models, because the outcome is not a discrete count.
+Similar considerations apply to multiplication rate and persistence.
+
+```{r}
+fit_bbr_itp <- brm_multiple(BBRsize | weights(cov_wt, scale = TRUE) ~ 
+                              soil_t_mean_centered + precipitation_centered +
+                              soil_t_mean_centered:precipitation_centered + cover + site,
+                            data = cwm_ITP$data$BBRsize,
+                            prior = prior_ln(cwm_ITP$data$BBRsize[[1]]$BBRsize),
+                            file = "fits/cwm/BBRsize.itp",
+                            file_refit = "never",
+                            control = list(seed = 2853))
+
+prior_summary(fit_bbr_itp)
+
+fit_bbr_itp
+
+multiple_convergence(fit_bbr_itp)
+
+my_mcmc_pairs(fit_bbr_itp)
+
+trank(fit_bbr_itp)
+
+my_ppc(fit_bbr_itp, cwm_ITP$data$BBRsize)
+
+my_resplot(fit_bbr_itp, cwm_ITP$data$BBRsize[[1]])
+
+mcmc_intervals(fit_bbr_itp, pars = show)
+
+my_ceffects(fit_bbr_itp)
+```
+
+## Multiplication rate
+
+```{r}
+fit_off_itp <- brm_multiple(bf(offspring | weights(cov_wt, scale = TRUE) ~
+                                        soil_t_mean_centered + precipitation_centered +
+                                        soil_t_mean_centered:precipitation_centered + cover + site,
+                                      hu ~ soil_t_mean_centered + precipitation_centered +
+                                        soil_t_mean_centered:precipitation_centered + cover + site),
+             data = cwm_ITP$data$offspring,
+             prior = prior_ln(cwm_ITP$data$offspring[[1]]$offspring, hu = T),
+             family = "hurdle_lognormal",
+             file = "fits/cwm/offspring.itp",
+             file_refit = "never",
+             control = list(seed = 2853))
+
+prior_summary(fit_off_itp)
+
+fit_off_itp
+
+multiple_convergence(fit_off_itp)
+
+my_mcmc_pairs(fit_off_itp, vars(!contains(c("hu", "lp", "b_Intercept"))))
+
+my_mcmc_pairs(fit_off_itp, pars = vars(contains("hu")))
+
+trank(fit_off_itp)
+
+my_ppc(fit_off_itp, cwm_ITP$data$offspring)
+
+my_resplot(fit_off_itp, cwm_ITP$data$offspring[[1]])
+
+mcmc_intervals(fit_off_itp, pars = vars(!contains(c("hu", "lp", "b_Intercept"))))
+
+mcmc_intervals(fit_off_itp, pars = vars(contains("hu")))
+
+my_ceffects(fit_off_itp, hurdle = T)
+```
+
+## Lateral spread
+
+```{r}
+fit_spread_itp <- brm_multiple(bf(spread | weights(cov_wt, scale = TRUE) ~
+                                    soil_t_mean_centered + precipitation_centered +
+                                    soil_t_mean_centered:precipitation_centered + cover + site,
+                                  hu ~ soil_t_mean_centered + precipitation_centered +
+                                    soil_t_mean_centered:precipitation_centered + cover + site),
+                               data = cwm_ITP$data$spread,
+                               prior = prior_ln(cwm_ITP$data$spread[[1]]$spread, hu = T),
+                               family = "hurdle_lognormal",
+                               file = "fits/cwm/spread.itp",
+                               file_refit = "never",
+                               control = list(seed = 2853))
+
+prior_summary(fit_spread_itp)
+
+fit_spread_itp
+
+multiple_convergence(fit_spread_itp)
+
+my_mcmc_pairs(fit_spread_itp, vars(!contains(c("hu", "lp", "b_Intercept"))))
+
+my_mcmc_pairs(fit_spread_itp, pars = vars(contains("hu")))
+
+trank(fit_spread_itp)
+
+my_ppc(fit_spread_itp, cwm_ITP$data$spread)
+
+my_resplot(fit_spread_itp, cwm_ITP$data$spread[[1]])
+
+mcmc_intervals(fit_spread_itp, pars = vars(!contains(c("hu", "lp", "b_Intercept"))))
+
+mcmc_intervals(fit_spread_itp, pars = vars(contains("hu")))
+
+my_ceffects(fit_spread_itp, hurdle = T)
+```
+
+## Persistence
+
+According to CLO-PLA "the data are effectively truncated by the value of 4 years, which should be interpreted as 4 years or more". To correctly account for this in the model, persistence values of 4 are considered as right-censored. In practice, the results are substantially unaffected.
+
+```{r}
+fit_pers_itp <- brm_multiple(bf(persistence | weights(cov_wt, scale = TRUE) +
+                                  cens(censored) ~
+                                  soil_t_mean_centered + precipitation_centered +
+                                  soil_t_mean_centered:precipitation_centered + cover + site,
+                                hu ~ soil_t_mean_centered + precipitation_centered +
+                                  soil_t_mean_centered:precipitation_centered + cover + site),
+                             data = cwm_ITP$data$persistence |>
+                               map(\(x) x |> 
+                                     mutate(censored = if_else(persistence * persistence_sd == 4, 1, 0))),
+                             prior = prior_ln(cwm_ITP$data$persistence[[1]]$persistence, hu = T),
+                             family = "hurdle_lognormal",
+                             file = "fits/cwm/persistence.itp",
+                             file_refit = "never",
+                             init = 0,
+                             control = list(seed = 2853))
+
+prior_summary(fit_pers_itp)
+
+fit_pers_itp
+
+multiple_convergence(fit_pers_itp)
+
+my_mcmc_pairs(fit_pers_itp, vars(!contains(c("hu", "lp", "b_Intercept"))))
+
+my_mcmc_pairs(fit_pers_itp, pars = vars(contains("hu")))
+
+trank(fit_pers_itp)
+
+my_ppc(fit_pers_itp, cwm_ITP$data$persistence, range = F)
+
+#this plot may not be meaningful for censored models
+my_resplot(fit_pers_itp, cwm_ITP$data$persistence[[1]])
+
+mcmc_intervals(fit_pers_itp, pars = vars(!contains(c("hu", "lp", "b_Intercept"))))
+
+mcmc_intervals(fit_pers_itp, pars = vars(contains("hu")))
+
+my_ceffects(fit_pers_itp, hurdle = T)
+```
+
+# Store fits
+
+```{r}
+#load brms fits
+fits <- list.files("fits/cwm", pattern = "\\.rds$", full.names = T) |> 
+  map(readRDS) |> 
+  as_tibble_col(column_name = "fit")
+
+#organize the models
+fits <- fits |> 
+  mutate(name = list.files("fits/cwm", pattern = "\\.rds$") |> 
+           str_remove("\\.rds$") |> 
+           str_replace_all("\\.", "_"),
+  trait = word(name, 1, sep = "_"),
+  type = word(name, 2, sep = "_"))
+
+#add data
+fits <- fits |> 
+  left_join(cwm_ITP) |> 
+  #average across imputations
+  mutate(data = map(data,
+                    \(x) x |> map(\(t) t |> 
+                             mutate(obs_id = row_number())) |>
+                         bind_rows(.id = "imp") |> 
+                         summarise(across(where(is.numeric), mean),
+                                   .by = c(site, obs_id)) |> 
+                         select(!obs_id)))
+```
+
+# Diagnostics
+
+## Check number of divergent transitions
+
+```{r}
+fits <- fits |> 
+    mutate(n_divergent = map_int(fit, 
+                   \(x) nuts_params(x) |> 
+                     filter(Parameter == "divergent__" & Value == 1) |> 
+                     nrow()))
+
+fits |> 
+  select(!c(data, fit)) |> 
+  filter(n_divergent > 0)
+```
+
+## Pareto *k*
+
+In a weighted regression, the Pareto *k* diagnostic can flag points as influential just because their weight is large, so it is not computed here.
+
+# Save results
+
+```{r}
+fits |> 
+  select(!n_divergent) |> 
+  saveRDS("intermediate/fits_cwm.rds")
+```
+
+# Session info
+
+```{r}
+#| echo: false
+sessioninfo::session_info()
+```

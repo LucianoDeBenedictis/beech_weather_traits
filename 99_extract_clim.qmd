@@ -1,0 +1,120 @@
+---
+title: "Gridded climate comparison"
+---
+
+# Setup
+
+```{r}
+library(conflicted)
+library(tidyverse)
+library(sf)
+library(stars)
+
+conflict_prefer("filter", "dplyr")
+
+sites <- read.csv("Data/sample_dates.csv") |> 
+  distinct(site, longitude, latitude)
+
+points <- sites |> 
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+```
+
+# Extract climate data
+
+## WorldClim
+
+```{r}
+# download from https://geodata.ucdavis.edu/climate/worldclim/2_1/base/wc2.1_2.5m_bio.zip
+
+temp_wc <- read_stars("Data/worldclim/wc2.1_2.5m_bio_1.tif")
+
+prec_wc <- read_stars("Data/worldclim/wc2.1_2.5m_bio_12.tif")
+```
+
+# CHELSA
+
+```{r}
+#https://os.unil.cloud.switch.ch/chelsa02/chelsa/global/bioclim/bio01/1981-2010/CHELSA_bio01_1981-2010_V.2.1.tif
+
+temp_ch <- read_stars("Data/chelsa/CHELSA_bio01_1981-2010_V.2.1.tif")
+
+#https://os.unil.cloud.switch.ch/chelsa02/chelsa/global/bioclim/bio12/1981-2010/CHELSA_bio12_1981-2010_V.2.1.tif
+
+prec_ch <- read_stars("Data/chelsa/CHELSA_bio12_1981-2010_V.2.1.tif")
+```
+
+## Extract values
+
+```{r}
+clim <- sites |> 
+  rename_with(str_to_sentence) |> 
+  mutate(`Annual mean temperature (°C) WorldClim` = st_extract(temp_wc, points)[[1]] |> 
+           round(2),
+         `Annual mean temperature (°C) CHELSA` = st_extract(temp_ch, points)[[1]] |> 
+           round(2),
+         `Annual precipitation (mm) WorldClim` = st_extract(prec_wc, points)[[1]],
+         `Annual precipitation (mm) CHELSA` = st_extract(prec_ch, points)[[1]])
+```
+
+# Measured weather
+
+The full OFD weather dataset is used, disregarding survey years, keeping years with 12 months of data.
+
+```{r}
+vars <- c("air_t_mean_OFD", "precipitation_OFD")
+
+weather <- read_rds("intermediate/weat.rds") |> 
+  select(site, year, month, all_of(vars))
+
+#there are a few cases where the two variables are not missing at the same time
+weather[which(xor(is.na(weather$air_t_mean_OFD), is.na(weather$precipitation_OFD))),]
+
+#hence create a complete tibble for each
+months <- weather |> 
+  summarise(across(all_of(vars), \(x) sum(!is.na(x))), .by = c(site, year)) 
+
+#site-years with 11 or 12 months
+keep <- map(vars, \(x) {
+  months |>
+    filter(.data[[x]] == 12) |> 
+    select(site, year)
+  }) |> 
+  set_names(vars)
+
+#subset data
+complete <- keep |> 
+  imap(\(x, idx) weather |>
+        select(site, year, month, all_of(idx)) |> 
+        semi_join(x, by = c("site", "year")))
+
+#annual means
+complete <- complete |> 
+  imap(\(x, idx) if(str_detect(idx, "precipitation")){
+    #sum precipitation
+    x |> 
+      summarise("{idx}" := sum(.data[[idx]]),
+                   .by = c(site, year)) |> 
+      #then site mean
+      summarise("{idx}" := mean(.data[[idx]]),
+                .by = site)
+  } else {
+    #average temperature
+    #12 months each year, so single step
+    x |> 
+         summarise("{idx}" := mean(.data[[idx]]),
+                   .by = site)
+  })
+
+#add to table
+clim <- clim |> 
+  mutate(`Annual mean temperature (°C) measured` = complete$air_t_mean_OFD$air_t_mean_OFD |> 
+           round(2),
+         .after = 5) |>
+  mutate(`Annual precipitation (mm) measured` = complete$precipitation_OFD$precipitation_OFD |> 
+           round(0))
+
+clim
+
+write_csv(clim, "output/clim_comparison.csv")
+```
+
