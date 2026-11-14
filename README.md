@@ -1,17 +1,18 @@
-# Effects of interannual weather on understory plant traits in old-growth beech forests
+# Effects of interannual weather on understorey plant traits in old-growth beech forests
 
-[![DOI](https://img.shields.io/badge/DOI-doi-blue)](https://doi.org/doi) ![Code License](https://img.shields.io/badge/code%20license-GPL--3.0-green) ![Data License](https://img.shields.io/badge/data%20license-CC%20BY%204.0-blue)
+[![DOI](https://img.shields.io/badge/DOI-10.5281/zenodo.24167182-blue)](https://doi.org/10.5281/zenodo.24167182) ![Code License](https://img.shields.io/badge/code%20license-GPL--3.0-green) ![Data License](https://img.shields.io/badge/data%20license-CC%20BY%204.0-blue)
 
 ## Description
-Data and code supporting the analyses in the article "Effects of interannual weather on understory plant traits in old-growth beech forests", De Benedictis et al.
+Data and code supporting the analyses in the article De Benedictis, L. L. M., Chelli, S., Canullo, R., Carmona, C. P., Cervellini, M., Tordoni, E., Tsakalos, J. L., & Campetella, G. (2026). Effects of interannual weather on understorey plant traits in old-growth beech forests. https://doi.org/10.32942/X2569N
+The article is currently in preprint.
 
 ## Abstract
 
-We aimed to estimate the effects of annual mean temperature and precipitation on understory plant traits and trait diversity in old-growth beech forests. We combined sub-canopy and open-field measurements from local weather stations with data on aboveground and belowground traits. 
+We aimed to estimate the effects of annual mean temperature and precipitation on understorey plant traits and trait diversity in old-growth beech forests. We combined sub-canopy and open-field measurements from local weather stations with data on aboveground and belowground traits. 
 Relationships and potential confounding effects within the system were analysed using a causal model. The resulting statistical model estimated the response of traits to interannual weather fluctuations within a site, exploiting the longitudinal data from a 12-year monitoring program.
 Overall, temperature effects were uncertain, while precipitation effects were more precisely estimated but small. Aboveground traits and trait diversity showed a positive response to temperature, while belowground traits a negative response to precipitation, highlighting the importance of considering distinct functional compartments and different sets of traits when assessing plant responses to environmental variability. 
 More than half of the variation in trait diversity occurred among neighbouring sub-plots, rather than among sites and years. This fine-scale heterogeneity suggests that micro-environmental factors and biotic interactions might have a larger effect on the coexistence of different functional strategies than broader-scale variation, environmental or otherwise.
-We conclude that interannual weather variability, especially in precipitation amount, has limited effects on the functional properties of understory plant communities in undisturbed beech forests. However, this apparent functional stability may be threatened by more frequent climatic extremes or altered seasonal weather patterns.
+We conclude that interannual weather variability, especially in precipitation amount, has limited effects on the functional properties of understorey plant communities in undisturbed beech forests. However, this apparent functional stability may be threatened by more frequent climatic extremes or altered seasonal weather patterns.
 
 ## Instructions
 To reproduce the analyses, render or inspect the quarto notebooks following the numbering. R ≥ 4.1 at least is required.
@@ -46,9 +47,8 @@ You need to install `cmdstanr`, following [these instructions](https://mc-stan.o
 L.L.M.D.B., G.C., and R.C. were supported by the RE.DI. (REducing risks of natural DIsasters) Consortium.
 
 ## Citation
-If you use this work please cite it using the DOI(s) above.
 
-> citation placeholder
+> De Benedictis, L. L. M., Chelli, S., Canullo, R., Carmona, C. P., Cervellini, M., Tordoni, E., Tsakalos, J. L., & Campetella, G. (2026). Effects of interannual weather on understory plant traits in old-growth beech forests. https://doi.org/10.32942/X2569N
 
 ## License
 - **Code:** licensed under GPL-3.0.
