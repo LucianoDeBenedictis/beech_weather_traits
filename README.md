@@ -548,48 +548,50 @@ Scripts should be run in the following order:
    (Optional, for supporting material) Extract gridded climate and compare with measurements
 
 ## R Environment
-**R version:** 4.6.1
+**R version:** 4.6.2
 
-| Package | Version |
-| :------ | :------ |
-| `bayesplot` | 1.16.0 |
-| `brms` | 2.23.0 |
-| `broom` | 1.0.13 |
-| `conflicted` | 1.2.0 |
-| `dagitty` | 0.3.4 |
-| `datawizard` | 1.4.1 |
-| `distributional` | 0.9.0 |
-| `dplyr` | 1.2.1 |
-| `DT` | 0.34.0 |
-| `elementalist` | 0.0.0.9000 |
-| `FD` | 1.0.12.6 |
-| `flexiblas` | 3.4.0 |
-| `ggdist` | 3.3.3 |
-| `gggrid` | 0.2.0 |
-| `ggmice` | 0.1.1 |
-| `ggrepel` | 0.9.8 |
-| `ggtext` | 0.2.0 |
-| `htmltools` | 0.5.9 |
-| `janitor` | 2.2.1 |
-| `lmodel2` | 1.7.4 |
-| `loo` | 2.10.1 |
-| `MASS` | 7.3.66 |
-| `mice` | 3.19.0 |
-| `miceadds` | 3.20.10 |
-| `paletteer` | 1.7.0 |
-| `patchwork` | 1.3.2 |
-| `plotly` | 4.12.1 |
-| `posterior` | 1.7.0 |
-| `psych` | 2.6.9 |
-| `readxl` | 1.6.0 |
-| `rlang` | 1.3.0 |
-| `rtry` | 1.1.0 |
-| `scales` | 1.4.0 |
-| `sessioninfo` | 1.2.4 |
-| `shape` | 1.4.6.1 |
-| `tidybayes` | 3.0.7 |
-| `tidyr` | 1.3.2 |
-| `tidyverse` | 2.0.0 |
+| Package | Version | Source |
+| :------ | :------ | :----- |
+| `bayesplot` | 1.16.0 | installed |
+| `brms` | 2.23.0 | installed |
+| `broom` | 1.0.13 | installed |
+| `conflicted` | 1.2.0 | installed |
+| `dagitty` | 0.3.4 | installed |
+| `datawizard` | 1.5.0 | installed |
+| `distributional` | 0.9.0 | installed |
+| `dplyr` | 1.2.1 | installed |
+| `DT` | 0.34.0 | installed |
+| `elementalist` | 0.0.0.9000 | installed |
+| `FD` | 1.0.12.6 | installed |
+| `flexiblas` | 3.4.0 | installed |
+| `ggdist` | 3.3.3 | installed |
+| `gggrid` | 0.2.0 | installed |
+| `ggmice` | 0.1.1 | installed |
+| `ggrepel` | 0.9.8 | installed |
+| `ggtext` | 0.2.0 | installed |
+| `htmltools` | 0.5.9 | installed |
+| `janitor` | 2.2.1 | installed |
+| `lmodel2` | 1.7.4 | installed |
+| `loo` | 2.10.1 | installed |
+| `MASS` | 7.3.66 | installed |
+| `mice` | 3.19.0 | installed |
+| `miceadds` | 3.20.10 | installed |
+| `paletteer` | 1.7.0 | installed |
+| `patchwork` | 1.3.2 | installed |
+| `plotly` | 4.12.1 | installed |
+| `posterior` | 1.7.0 | installed |
+| `psych` | 2.6.9 | installed |
+| `readxl` | 1.6.0 | installed |
+| `rlang` | 1.3.0 | installed |
+| `rtry` | 1.1.0 | installed |
+| `scales` | 1.4.0 | installed |
+| `sessioninfo` | 1.2.4 | installed |
+| `sf` | 1.1.3 | installed |
+| `shape` | 1.4.6.1 | installed |
+| `stars` | 0.7.3 | installed |
+| `tidybayes` | 3.0.7 | installed |
+| `tidyr` | 1.3.2 | installed |
+| `tidyverse` | 2.0.0 | installed |
 
 ---
-*README generated with [READMEBuilder](https://github.com/EIvimeyCook/READMEBuilder/tree/main) on 22 October 2026.*
+*README generated with [READMEBuilder](https://github.com/EIvimeyCook/READMEBuilder/tree/main) on 14 November 2026.*

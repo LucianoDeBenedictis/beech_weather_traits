@@ -106,7 +106,7 @@ cols[c("M_OF", "M_SC")] <- "firebrick"
 
 est <- c("Aboveground traits", "Belowground traits", "Open-field air temperature",
          "Open-field precipitation", "Sub-canopy air temperature", "Sub-canopy precipitation",
-         "Sub-canopy soil temperature", "Overall FD")
+         "Sub-canopy soil temperature", "Overall FD", "Soil features")
 
 edg <- edges(dag)[, 1:2] |> 
   mutate(col = if_else((v %in% est) & (w %in% est),
